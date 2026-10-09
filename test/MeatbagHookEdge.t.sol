@@ -216,14 +216,16 @@ contract MeatbagHookEdgeTest is HookTestBase {
     }
 
     function test_launchSurplusOnExactOutputBuysGoesToThePot() public {
-        // At t=0 the rate is 25%; an exact-output buy charges 25% of what the pool took.
+        // At t=0 the rate is 25%; an exact-output buy charges 25% of everything the buyer spends, which
+        // is a third of what the pool took, and the 2% base is measured on that same spend.
         uint256 ethBefore = address(this).balance;
         buyExactOut(1 ether, 5 ether);
         uint256 paid = ethBefore - address(this).balance;
         uint256 fee = game.pot() + SWARM.balance + address(treasury).balance;
         uint256 poolTook = paid - fee;
-        assertEq(fee, poolTook * 2500 / 10_000);
-        uint256 base = poolTook * 200 / 10_000;
+        assertEq(fee, poolTook * 2500 / 7500);
+        assertEq(fee, paid * 2500 / 10_000, "25% of the spend");
+        uint256 base = paid * 200 / 10_000;
         assertEq(SWARM.balance, base * 2500 / 10_000);
         assertEq(address(treasury).balance, base * 2000 / 10_000);
         assertEq(game.pot(), fee - SWARM.balance - address(treasury).balance);
@@ -239,5 +241,91 @@ contract MeatbagHookEdgeTest is HookTestBase {
         emit Message(herald.TO(), herald.textOf(3));
         buyExactIn(80 ether);
         assertEq(herald.count(), 5);
+    }
+
+    // ---------------------------------------------------------------- the revised fee base and partial fills
+
+    /// @notice An exact-output buy pays the buy rate on everything the buyer spends, exactly as an
+    /// exact-input buy does, at every point of the decay: fee = poolEth x rate / (1e4 - rate).
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_exactOutputBuyPaysTheBuyRateOnTheWholeSpend(uint96 tokensOut, uint32 elapsed) public {
+        tokensOut = uint96(bound(tokensOut, 1e12, 50 ether));
+        elapsed = uint32(bound(elapsed, 0, 1 hours));
+        vm.warp(hook.launchedAt() + elapsed);
+        uint256 rate = hook.buyFeeBps();
+        uint256 ethBefore = address(this).balance;
+        buyExactOut(tokensOut, 200 ether);
+        uint256 paid = ethBefore - address(this).balance;
+        uint256 fee = game.pot() + SWARM.balance + address(treasury).balance;
+        uint256 poolEth = paid - fee;
+        assertEq(fee, poolEth * rate / (10_000 - rate), "fee is not the rate on the whole spend");
+        // Within rounding, the fee over the spend is the rate: the same base as an exact-input buy.
+        assertApproxEqAbs(fee * 10_000 / paid, rate, 1);
+        assertEq(hook.volume(), paid, "volume is the whole spend");
+    }
+
+    /// @notice A refused partial fill leaves no trace: no fee, no volume, no letter, no claim, no owed
+    /// balance, and the transient fee slot does not leak into the next swap.
+    function test_refusedPartialFillLeavesNoTraceAndTheNextSwapIsClean() public {
+        vm.warp(block.timestamp + 1 hours);
+        uint256 ethBefore = address(this).balance;
+        uint256 tokensBefore = token.balanceOf(address(this));
+        // A limit a hair below the current price: a 5 ETH buy cannot be filled within it.
+        uint160 limit = uint160(uint256(SQRT_PRICE_1_1) * 999 / 1000);
+        vm.expectRevert();
+        swapRouter.swap{value: 5 ether}(
+            key, SwapParams(true, -5 ether, limit), PoolSwapTest.TestSettings(false, false), ""
+        );
+        assertEq(address(this).balance, ethBefore, "the refused buy kept ETH");
+        assertEq(token.balanceOf(address(this)), tokensBefore);
+        assertEq(hook.volume(), 0);
+        assertEq(game.pot() + SWARM.balance + address(treasury).balance, 0, "a refused swap paid a fee");
+        assertEq(hook.claims() + hook.owedPot() + hook.owedSwarm() + hook.owedTreasury(), 0);
+        assertFalse(herald.sent(0), "a refused swap counted as the first trade");
+
+        // The next ordinary swap is charged on its own amount only.
+        buyExactIn(1 ether);
+        assertEq(game.pot() + SWARM.balance + address(treasury).balance, 0.02 ether);
+        assertEq(hook.volume(), 1 ether);
+    }
+
+    /// @notice An exact-output sell cut short is refused the same way, and the seller keeps their MEAT.
+    function test_refusedPartialFillSellKeepsTheSellersTokens() public {
+        vm.warp(block.timestamp + 1 hours);
+        uint256 tokensBefore = token.balanceOf(address(this));
+        uint160 limit = uint160(uint256(SQRT_PRICE_1_1) * 1001 / 1000);
+        vm.expectRevert();
+        swapRouter.swap(key, SwapParams(false, 5 ether, limit), PoolSwapTest.TestSettings(false, false), "");
+        assertEq(token.balanceOf(address(this)), tokensBefore);
+        assertEq(hook.volume(), 0);
+        assertEq(game.pot() + SWARM.balance + address(treasury).balance, 0);
+    }
+
+    /// @notice ETH donated to the hook while fees sit as claims (a manager without ETH) prepays what is
+    /// owed, and once the claims are redeemed every recipient has exactly its share plus the pot has the
+    /// donation: nothing is lost or double-counted on the way.
+    function test_donationWhileClaimsArePendingIsNeitherLostNorCountedTwice() public {
+        setUpPool(false); // a fresh manager seeded with tokens only
+        vm.warp(hook.launchedAt() + 1 hours);
+        buyExactIn(1 ether); // 0.02 ETH fee, minted as a claim: the manager held no ETH yet
+        assertEq(hook.claims(), 0.02 ether);
+        assertEq(hook.owedPot(), 0.011 ether);
+        assertEq(game.pot(), 0);
+
+        (bool ok,) = address(hook).call{value: 0.005 ether}("");
+        assertTrue(ok);
+        hook.distribute();
+        assertEq(address(hook).balance, 0, "the donation stayed in the hook");
+        assertEq(game.pot(), 0.005 ether, "the donation reached the pot");
+        assertEq(hook.owedPot(), 0.006 ether, "the donation prepaid part of what the pot is owed");
+        assertEq(hook.claims(), 0.02 ether, "the claim is untouched");
+
+        buyExactIn(1 ether); // the manager now holds ETH: this fee and the claim are taken as ETH
+        assertEq(hook.claims(), 0);
+        assertEq(hook.owedPot() + hook.owedSwarm() + hook.owedTreasury(), 0);
+        assertEq(address(hook).balance, 0);
+        assertEq(game.pot(), 0.022 ether + 0.005 ether, "two 55% shares plus the donation");
+        assertEq(SWARM.balance, 0.01 ether, "two 25% shares");
+        assertEq(address(treasury).balance, 0.008 ether, "two 20% shares");
     }
 }

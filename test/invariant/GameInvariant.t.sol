@@ -25,7 +25,8 @@ contract GameHandler is Test {
     uint256 public verdicts;
     uint256 public hungJuries;
     uint256 public sunsets;
-    uint256 public deliveriesFailed;
+    /// @dev Valid deliveries that ran out of the 200,000 gas stipend and had to be repeated with more.
+    uint256 public stipendFailures;
     mapping(address => uint256) public withdrawnBy;
 
     constructor(MeatbagGame game_, MockIntake intake_, MockERC20 imd_) {
@@ -77,6 +78,18 @@ contract GameHandler is Test {
         vm.warp(vm.getBlockTimestamp() + hoursAhead * 1 hours);
     }
 
+    /// @dev The intake's price moves (never to zero here: the mock then refuses the request, which is
+    /// the mock's rule rather than the game's; the zero fallback has its own unit test).
+    function setPrice(uint256 price) external {
+        price = bound(price, 1, 2 ether);
+        intake.setPrice(price);
+    }
+
+    /// @dev The intake stops or resumes selling the action.
+    function setRefusing(bool refusing) external {
+        intake.setRefusing(refusing);
+    }
+
     function judge(uint256 actorSeed) external {
         address who = actors[actorSeed % ACTORS];
         uint256 day = game.nextRoundToJudge();
@@ -90,8 +103,43 @@ contract GameHandler is Test {
             day = game.roundDays(idx);
         }
         if (day >= game.today()) return;
+        if (intake.refusing()) {
+            vm.prank(who);
+            try game.judge() {
+                revert("judge went through while the intake refuses the action");
+            } catch {}
+            return;
+        }
+        uint256 price = game.judgePrice();
+        require(price == intake.price(), "judgePrice does not follow the intake");
+        uint256 imdBefore = imd.balanceOf(who);
+        uint256 potBefore = game.pot();
+        bool sunsetWasDue = game.sunsetDue();
         vm.prank(who);
         game.judge();
+        if (sunsetWasDue) sunsets++;
+        require(imdBefore - imd.balanceOf(who) == price, "judge pulled something other than the price");
+        require(imd.balanceOf(address(intake)) >= price, "the intake was not paid");
+        // A sweep of a timed-out round or a due sunset shrinks the pot before the reward is measured.
+        if (!sunsetWasDue && r.status != MeatbagGame.Status.Pending) {
+            require(game.claimable(who) >= potBefore * 300 / 10_000, "keeper not rewarded 3%");
+        }
+        require(game.unsettledStreak() < game.SUNSET_AFTER(), "judge left a sunset due");
+    }
+
+    /// @dev Splits a sunset the oracle callback left due; refused otherwise.
+    function sunset() external {
+        if (game.sunsetDue()) {
+            uint256 potBefore = game.pot();
+            game.sunset();
+            sunsets++;
+            require(game.unsettledStreak() == 0, "sunset did not reset the streak");
+            require(game.pot() <= potBefore, "sunset grew the pot");
+            return;
+        }
+        try game.sunset() {
+            revert("sunset went through while none was due");
+        } catch {}
     }
 
     function deliver(uint256 answerSeed, uint256 kind) external {
@@ -123,33 +171,55 @@ contract GameHandler is Test {
         (uint8 v, bytes32 rr, bytes32 ss) = vm.sign(SIGNER_KEY, game.attestationDigest(a));
         uint256 cursorBefore = game.cursor();
         uint256 streakBefore = game.unsettledStreak();
-        bool ok = intake.deliver(r.intakeRequestId, a, abi.encodePacked(rr, ss, v));
+        bytes memory sig = abi.encodePacked(rr, ss, v);
+        bool ok = intake.deliver(r.intakeRequestId, a, sig);
         if (!ok) {
-            deliveriesFailed++;
-            return;
+            // A well-formed, well-signed answer for the pending request should always land under the
+            // writer's 200,000 gas stipend. It does not: the first verdict needs about 211,000 gas
+            // once the keeper has pulled their reward (see .imd-findings.json, "first verdict exceeds
+            // the stipend"). The failure is counted, not blessed, and the delivery is repeated with
+            // unbounded gas, which bubbles any revert that is not out-of-gas: the attestation itself
+            // must be good.
+            stipendFailures++;
+            intake.deliverTo(address(game), game.onOracleResult.selector, r.intakeRequestId, a, sig);
         }
         require(game.cursor() == cursorBefore + 1, "a delivered answer must close the round");
         if (kind >= 7) {
             hungJuries++;
-            if (game.unsettledStreak() == 0) sunsets++;
-            else require(game.unsettledStreak() == streakBefore + 1, "streak grows by one per hung jury");
+            // The callback never splits the pot itself: the seventh hung jury leaves the sunset due.
+            require(game.unsettledStreak() == streakBefore + 1, "streak grows by one per hung jury");
+            require(game.sunsetDue() == (game.unsettledStreak() >= game.SUNSET_AFTER()), "sunsetDue");
         } else {
             verdicts++;
             require(game.unsettledStreak() == 0, "a verdict resets the streak");
         }
     }
 
+    /// @dev Declares the cursor round hung once `hungJuryAt()` has passed: a timed-out request, or a
+    /// closed round nobody judged (the intake refusing, say). Refused one second earlier.
     function declareHung() external {
         uint256 day = game.nextRoundToJudge();
         if (day == 0) return;
-        MeatbagGame.Round memory r = game.round(day);
-        if (r.status != MeatbagGame.Status.Pending) return;
-        if (vm.getBlockTimestamp() < r.requestedAt + game.VERDICT_TIMEOUT()) return;
+        uint256 at = game.hungJuryAt();
+        if (vm.getBlockTimestamp() < at) {
+            try game.declareHungJury() {
+                revert("a round was hung before hungJuryAt");
+            } catch {}
+            return;
+        }
         uint256 streakBefore = game.unsettledStreak();
+        bool sunsetWasDue = game.sunsetDue();
         game.declareHungJury();
         hungJuries++;
-        if (game.unsettledStreak() == 0) sunsets++;
-        else require(game.unsettledStreak() == streakBefore + 1, "streak grows by one");
+        if (sunsetWasDue) sunsets++;
+        uint256 streak = game.unsettledStreak();
+        if (streak == 0) {
+            sunsets++;
+            require(sunsetWasDue || streakBefore + 1 == game.SUNSET_AFTER(), "streak reset without a sunset");
+        } else {
+            require(streak == (sunsetWasDue ? 1 : streakBefore + 1), "streak grows by one");
+        }
+        require(game.round(day).status == MeatbagGame.Status.Hung, "round not hung");
     }
 
     function claim(uint256 actorSeed) external {
@@ -266,10 +336,19 @@ contract GameInvariantTest is Test {
         }
     }
 
-    /// @notice The sunset rule fires at seven: the streak never reaches it.
-    function invariant_streakNeverReachesSunset() public view {
-        assertLt(game.unsettledStreak(), game.SUNSET_AFTER(), "streak reached the sunset threshold");
-        assertLe(game.unsettledStreak(), game.cursor());
+    /// @notice The sunset rule fires at seven: the streak never passes it, and at seven the split is
+    /// due (left by the oracle callback for `sunset()`, `judge()` or `declareHungJury()` to settle).
+    function invariant_streakNeverPassesSunset() public view {
+        uint256 streak = game.unsettledStreak();
+        assertLe(streak, game.SUNSET_AFTER(), "streak passed the sunset threshold");
+        assertEq(game.sunsetDue(), streak == game.SUNSET_AFTER(), "sunsetDue disagrees with the streak");
+        assertLe(streak, game.cursor());
+        // The streak's rounds are the last `streak` finished rounds, all hung and not yet split.
+        for (uint256 i = game.cursor() - streak; i < game.cursor(); i++) {
+            MeatbagGame.Round memory r = game.round(game.roundDays(i));
+            assertTrue(r.status == MeatbagGame.Status.Hung, "a streak round is not hung");
+            assertEq(r.sunsetShare, 0, "a streak round was already split");
+        }
     }
 
     /// @notice The pot record never falls below the pot at any judging, and the pot never exceeds what

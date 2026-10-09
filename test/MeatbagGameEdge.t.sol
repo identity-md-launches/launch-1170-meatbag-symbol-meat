@@ -375,9 +375,9 @@ contract MeatbagGameEdgeTest is Test {
 
     // ---------------------------------------------------------------- the sunset inside the callback
 
-    /// @notice A seventh hung jury delivered by the oracle runs the sunset loop inside the 200,000 gas
-    /// callback stipend. Whether or not that delivery fits, the pot must still reach the entrants: by the
-    /// callback, or by `declareHungJury()` after the timeout.
+    /// @notice A seventh hung jury delivered by the oracle lands under the 200,000 gas callback stipend
+    /// and leaves the split due; `sunset()` then performs it. Whether or not that delivery fits, the pot
+    /// must still reach the entrants: by `sunset()`, or by `declareHungJury()` after the timeout.
     function test_seventhHungJuryFromTheOracleStillSunsetsThePot() public {
         (bool ok,) = address(game).call{value: 7 ether}("");
         assertTrue(ok);
@@ -395,6 +395,11 @@ contract MeatbagGameEdgeTest is Test {
             assertEq(uint8(game.round(game.roundDays(6)).status), uint8(MeatbagGame.Status.Pending));
             vm.warp(vm.getBlockTimestamp() + game.VERDICT_TIMEOUT());
             game.declareHungJury();
+        } else {
+            assertEq(uint8(game.round(game.roundDays(6)).status), uint8(MeatbagGame.Status.Hung));
+            assertEq(game.unsettledStreak(), 7, "the callback only marks the round hung");
+            assertTrue(game.sunsetDue());
+            game.sunset();
         }
         assertEq(game.unsettledStreak(), 0, "the sunset happened");
         uint256 share = game.round(game.roundDays(0)).sunsetShare;
@@ -448,5 +453,113 @@ contract MeatbagGameEdgeTest is Test {
         OracleAttestation.Attestation memory a = attestation(id, 39);
         assertTrue(intake.deliver(id, a, sign(a)), "a full round settles under 200k gas");
         assertEq(game.round(game.roundDays(0)).winner, 39);
+    }
+
+    // ---------------------------------------------------------------- unjudged rounds, the sunset call, the live price
+
+    /// @notice A closed round nobody judged may be hung from `hungJuryAt()` exactly (01:00 UTC two days
+    /// after its day) and not one second before; an open round can never be hung.
+    function test_unjudgedRoundHangsAtHungJuryAtExactlyNotBefore() public {
+        uint256 day = game.today();
+        enterAs(alice, "a");
+        assertEq(game.hungJuryAt(), (day + 1) * 1 days + game.VERDICT_TIMEOUT());
+        vm.expectRevert(abi.encodeWithSelector(MeatbagGame.NotTimedOut.selector, day));
+        game.declareHungJury(); // still open
+        vm.warp(game.hungJuryAt() - 1);
+        vm.expectRevert(abi.encodeWithSelector(MeatbagGame.NotTimedOut.selector, day));
+        game.declareHungJury();
+        vm.warp(game.hungJuryAt());
+        game.declareHungJury();
+        assertEq(uint8(game.round(day).status), uint8(MeatbagGame.Status.Hung));
+        assertEq(game.unsettledStreak(), 1);
+        assertEq(game.hungJuryAt(), 0, "nothing waits");
+        vm.expectRevert(MeatbagGame.NothingToJudge.selector);
+        game.declareHungJury();
+    }
+
+    /// @notice `hungJuryAt()` switches to the request's own timeout once a round is pending, so judging
+    /// a round late pushes its hung-jury moment out rather than leaving it already due.
+    function test_hungJuryAtFollowsTheRequestOnceJudged() public {
+        uint256 day = game.today();
+        enterAs(alice, "a");
+        vm.warp((day + 1) * 1 days + game.VERDICT_TIMEOUT() - 1); // one second before it could be hung
+        judgeAs(keeper);
+        assertEq(game.hungJuryAt(), vm.getBlockTimestamp() + game.VERDICT_TIMEOUT());
+        vm.expectRevert(abi.encodeWithSelector(MeatbagGame.NotTimedOut.selector, day));
+        game.declareHungJury();
+    }
+
+    /// @notice `sunset()` is refused unless seven rounds are unsettled, and settles exactly once.
+    function test_sunsetRefusedUnlessDueAndOnlyOnce() public {
+        vm.expectRevert(MeatbagGame.NoSunsetDue.selector);
+        game.sunset();
+        for (uint256 i = 0; i < 6; i++) {
+            hungRound(alice);
+        }
+        vm.expectRevert(MeatbagGame.NoSunsetDue.selector);
+        game.sunset();
+        // The seventh hung jury comes from the oracle: it leaves the split to anyone.
+        enterAs(alice, "a");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        OracleAttestation.Attestation memory a = attestation(id, 0);
+        a.agreed = 3;
+        assertTrue(intake.deliver(id, a, sign(a)));
+        assertTrue(game.sunsetDue());
+        assertEq(game.unsettledStreak(), 7);
+        uint256 pot = game.pot();
+        game.sunset();
+        assertFalse(game.sunsetDue());
+        assertEq(game.pot(), pot - (pot / 7) * 7, "only the division's dust stays in the pot");
+        assertEq(game.round(game.roundDays(6)).sunsetShare, pot / 7);
+        vm.expectRevert(MeatbagGame.NoSunsetDue.selector);
+        game.sunset();
+    }
+
+    /// @notice While a sunset is due, entering continues and the new round is untouched by the split.
+    function test_entriesDuringADueSunsetAreNotPartOfTheSplit() public {
+        for (uint256 i = 0; i < 6; i++) {
+            hungRound(alice);
+        }
+        enterAs(alice, "a");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        OracleAttestation.Attestation memory a = attestation(id, 0);
+        a.agreed = 3;
+        assertTrue(intake.deliver(id, a, sign(a)));
+        assertTrue(game.sunsetDue());
+        enterAs(bob, "b"); // today's round, after the seventh hung one
+        uint256 bobsDay = game.today();
+        game.sunset();
+        assertEq(game.round(bobsDay).sunsetShare, 0, "the open round was split");
+        assertEq(uint8(game.round(bobsDay).status), uint8(MeatbagGame.Status.Open));
+        vm.prank(bob);
+        vm.expectRevert(MeatbagGame.NothingToClaim.selector);
+        game.claimSunset(bobsDay);
+    }
+
+    /// @notice The keeper's IMD is pulled at the intake's price of the moment, and a price the intake
+    /// raises after approval is what the next judge pays.
+    function test_judgePullsThePriceOfTheMoment() public {
+        intake.setPrice(0.75 ether);
+        enterAs(alice, "a");
+        nextDay();
+        uint256 before = imd.balanceOf(keeper);
+        judgeAs(keeper);
+        assertEq(before - imd.balanceOf(keeper), 0.75 ether);
+        assertEq(imd.balanceOf(address(intake)), 0.75 ether);
+        assertEq(imd.allowance(address(game), address(intake)), 0, "no approval left dangling");
+    }
+
+    /// @notice A keeper who holds less IMD than the live price cannot judge.
+    function test_judgeRefusedWhenTheKeeperCannotPayTheLivePrice() public {
+        enterAs(alice, "a");
+        nextDay();
+        intake.setPrice(200 ether); // more than the keeper holds
+        vm.prank(keeper);
+        vm.expectRevert();
+        game.judge();
+        assertEq(uint8(game.round(game.roundDays(0)).status), uint8(MeatbagGame.Status.Open));
+        assertEq(game.claimable(keeper), 0, "no reward for a failed judge");
     }
 }
