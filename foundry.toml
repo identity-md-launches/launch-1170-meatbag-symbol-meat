@@ -1,0 +1,31 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+bytecode_hash = "none"
+cbor_metadata = false
+ffi = false
+fs_permissions = []
+# Fork rehearsals live under test/fork and need a mainnet RPC; the default run skips them so the
+# suite passes offline. Run them with `FOUNDRY_PROFILE=fork forge test`.
+no_match_path = "test/fork/**"
+
+[profile.default.fuzz]
+runs = 64
+
+[profile.fork]
+match_path = "test/fork/**"
+no_match_path = "test/none/**"
+
+[rpc_endpoints]
+mainnet = "https://ethereum-rpc.publicnode.com"
+
+[fmt]
+line_length = 120
