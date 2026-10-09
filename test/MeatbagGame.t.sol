@@ -278,9 +278,8 @@ contract MeatbagGameTest is Test {
         bytes32 id = judgeAs(keeper);
         uint256 pot = game.pot();
 
-        vm.expectEmit(true, false, false, true, address(herald));
-        emit Message(herald.TO(), herald.textOf(4));
         assertTrue(settle(id, 1), "callback ran under 200k gas");
+        assertFalse(herald.sent(4), "the letter waits for an ordinary transaction");
 
         MeatbagGame.Round memory r = game.round(day);
         assertEq(uint8(r.status), uint8(MeatbagGame.Status.Settled));
@@ -295,13 +294,63 @@ contract MeatbagGameTest is Test {
         assertEq(game.pendingDay(id), 0);
 
         uint256 before = bob.balance;
+        vm.expectEmit(true, false, false, true, address(herald));
+        emit Message(herald.TO(), herald.textOf(4));
         vm.prank(bob);
         game.claim();
+        assertTrue(game.firstVerdictAnnounced());
         assertEq(bob.balance - before, pot * 80 / 100);
         vm.prank(bob);
         vm.expectRevert(MeatbagGame.NothingToClaim.selector);
         game.claim();
         assertEq(address(game).balance, game.pot() + game.totalClaimable());
+    }
+
+    function test_firstVerdictFitsTheStipendAfterTheKeeperClaimed() public {
+        uint256 day = game.today();
+        enterAs(alice, "hello, i am a person");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        vm.prank(keeper);
+        game.claim();
+        assertEq(game.totalClaimable(), 0);
+        // MockIntake delivers with exactly 200,000 gas, as the oracle writer does.
+        assertTrue(settle(id, 0), "a valid first verdict must land under 200,000 gas");
+        assertEq(uint8(game.round(day).status), uint8(MeatbagGame.Status.Settled));
+        assertGt(game.claimable(alice), 0);
+        assertFalse(herald.sent(4));
+    }
+
+    function test_firstVerdictLetterIsPostedOnceByTheNextPublicCall() public {
+        enterAs(alice, "a");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        // Nothing settled yet: no letter.
+        game.announceFirstVerdict();
+        assertFalse(herald.sent(4));
+        assertTrue(settle(id, 0));
+
+        uint256 countBefore = herald.count();
+        vm.expectEmit(true, false, false, true, address(herald));
+        emit Message(herald.TO(), herald.textOf(4));
+        vm.prank(address(0xBEEF));
+        game.announceFirstVerdict();
+        assertTrue(game.firstVerdictAnnounced());
+        assertEq(herald.count(), countBefore + 1);
+        game.announceFirstVerdict();
+        assertEq(herald.count(), countBefore + 1, "posted once");
+    }
+
+    function test_nextJudgePostsTheFirstVerdictLetter() public {
+        enterAs(alice, "a");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        assertTrue(settle(id, 0));
+        enterAs(bob, "b");
+        nextDay();
+        judgeAs(keeper);
+        assertTrue(herald.sent(4));
+        assertTrue(game.firstVerdictAnnounced());
     }
 
     // ---------------------------------------------------------------- attestation checks

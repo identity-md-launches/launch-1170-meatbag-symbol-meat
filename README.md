@@ -127,7 +127,10 @@ and is pushed to the pot by the next swap or `distribute()`; nothing can stay in
   consumed once. Requires `panelSize ≥ 7`, `quorum ≥ 4`, `agreed ≥ quorum`, answer type `uint256` and
   an index inside the round; otherwise the round is recorded as a **hung jury**, never a revert. A
   verdict pays the winner **80% of the pot** as a pull claim; the rest carries over. The callback runs
-  within the 200,000 gas stipend (tested).
+  within the 200,000 gas stipend (tested, including the game's first round after the keeper has
+  already claimed, the costliest case). To fit, the callback does not post the herald's first-verdict
+  letter: the next `judge()`, `declareHungJury()`, `sunset()`, `claim()` (the winner's, typically) or
+  the public `announceFirstVerdict()` posts it, once.
 - **No verdict** (panel disagreed, body refused, nobody delivered): after `VERDICT_TIMEOUT`
   (86400 + 3600 s) anyone calls `declareHungJury()`, or the next `judge()` sweeps it. The pot carries
   over.
@@ -150,8 +153,9 @@ and is pushed to the pot by the next swap or `distribute()`; nothing can stay in
 ## The herald
 
 `MeatbagHerald` posts the launch letter verbatim from its constructor, then only fixed automatic
-messages: first trade, volume 1 / 10 / 100 ETH (from the hook), first verdict, first hung jury and every
-pot record (from the game, at judging time). One-time codes are posted once. No public caller can supply
+messages: first trade, volume 1 / 10 / 100 ETH (from the hook), first verdict (from the game's next public
+call after the verdict, not from the oracle callback), first hung jury and every pot record (from the
+game, at judging time). One-time codes are posted once. No public caller can supply
 text. The single exception the brief requires: the swarm's heartbeat wallet
 (`0xd011…bca13`) may `post(text)` the letter that ends each heartbeat job, on what it built and why. All
 project news goes out only as `Message` events.

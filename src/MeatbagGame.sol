@@ -150,6 +150,10 @@ contract MeatbagGame is OracleAttestationConsumer {
     uint256 public cursor;
     /// @notice How many rounds in a row ended without a verdict.
     uint256 public unsettledStreak;
+    /// @notice Whether the herald has posted the first-verdict letter. The oracle callback does not post
+    /// it (the letter does not fit the writer's 200,000 gas stipend); the next `judge()`,
+    /// `declareHungJury()`, `sunset()`, `claim()` or `announceFirstVerdict()` does.
+    bool public firstVerdictAnnounced;
 
     mapping(uint256 day => Round) internal _rounds;
     mapping(uint256 day => Entry[]) internal _entries;
@@ -248,6 +252,7 @@ contract MeatbagGame is OracleAttestationConsumer {
     /// the pot as a pull claim. A previous request that timed out is declared a hung jury on the way,
     /// and a sunset that is due is settled first.
     function judge() external returns (bytes32 intakeRequestId) {
+        _announceFirstVerdict();
         _settleDueSunset();
         if (cursor >= roundDays.length) revert NothingToJudge();
         uint256 day = roundDays[cursor];
@@ -284,6 +289,7 @@ contract MeatbagGame is OracleAttestationConsumer {
     /// got no verdict, or a closed round that nobody could judge (the intake refuses it, say). Either way
     /// the pot carries over and the round counts toward the sunset rule.
     function declareHungJury() external {
+        _announceFirstVerdict();
         _settleDueSunset();
         if (cursor >= roundDays.length) revert NothingToJudge();
         uint256 day = roundDays[cursor];
@@ -296,7 +302,14 @@ contract MeatbagGame is OracleAttestationConsumer {
     /// `declareHungJury()` do the same on their way.
     function sunset() external {
         if (unsettledStreak < SUNSET_AFTER) revert NoSunsetDue();
+        _announceFirstVerdict();
         _sunset();
+    }
+
+    /// @notice Posts the herald's first-verdict letter once a round has settled. Anyone may call it; the
+    /// game's other public transitions call it on their way.
+    function announceFirstVerdict() external {
+        _announceFirstVerdict();
     }
 
     /// @notice Whether seven rounds in a row are unsettled and the pot waits to be split.
@@ -345,7 +358,6 @@ contract MeatbagGame is OracleAttestationConsumer {
         address winner = _entries[day][index].author;
         _credit(winner, prize);
         emit Verdict(day, index, winner, prize, a.panelJobId, a.agreed);
-        herald.announce(_H_FIRST_VERDICT);
     }
 
     // ------------------------------------------------------------------ claims
@@ -354,6 +366,7 @@ contract MeatbagGame is OracleAttestationConsumer {
     function claim() external {
         uint256 amount = claimable[msg.sender];
         if (amount == 0) revert NothingToClaim();
+        _announceFirstVerdict();
         claimable[msg.sender] = 0;
         totalClaimable -= amount;
         emit Claimed(msg.sender, amount);
@@ -447,6 +460,16 @@ contract MeatbagGame is OracleAttestationConsumer {
         emit HungJury(day, unsettledStreak);
         herald.announce(_H_FIRST_HUNG_JURY);
         if (settleSunset && unsettledStreak >= SUNSET_AFTER) _sunset();
+    }
+
+    /// @dev Posts the first-verdict letter when the round just behind the cursor settled. Every path
+    /// that moves the cursor past a settled round outside the callback calls this first, so the letter
+    /// cannot be skipped.
+    function _announceFirstVerdict() internal {
+        if (firstVerdictAnnounced || cursor == 0) return;
+        if (_rounds[roundDays[cursor - 1]].status != Status.Settled) return;
+        firstVerdictAnnounced = true;
+        herald.announce(_H_FIRST_VERDICT);
     }
 
     function _settleDueSunset() internal {
