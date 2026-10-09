@@ -8,6 +8,8 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {HookFlags} from "../src/HookFlags.sol";
 import {MeatbagHook} from "../src/MeatbagHook.sol";
@@ -109,7 +111,7 @@ contract MeatbagHookTest is HookTestBase {
         assertEq(hook.volume(), 1 ether);
     }
 
-    function test_buyExactOutputPaysTwoPercentOfTheEthThePoolTook() public {
+    function test_buyExactOutputPaysTwoPercentOfTheEthTheBuyerSpends() public {
         vm.warp(block.timestamp + 1 hours);
         uint256 ethBefore = address(this).balance;
         uint256 tokensBefore = token.balanceOf(address(this));
@@ -119,9 +121,108 @@ contract MeatbagHookTest is HookTestBase {
         assertEq(token.balanceOf(address(this)) - tokensBefore, 1 ether, "exact output honoured");
         uint256 paid = ethBefore - address(this).balance;
         uint256 fee = game.pot() + (SWARM.balance) + address(treasury).balance;
-        // fee = 2% of what the pool took, i.e. paid = poolTook + fee with fee = poolTook / 50.
-        uint256 poolTook = paid - fee;
-        assertApproxEqAbs(fee, poolTook * 200 / 10_000, 2);
+        // The same base as an exact-input buy: the fee is 2% of everything the buyer paid.
+        assertApproxEqAbs(fee, paid * 200 / 10_000, 2);
+        assertEq(hook.volume(), paid, "volume is the ETH the buyer spent");
+    }
+
+    function test_buyExactOutputAtLaunchPaysTwentyFivePercentOfTheSpendLikeAnExactInputBuy() public {
+        assertEq(hook.buyFeeBps(), 2500);
+        uint256 ethBefore = address(this).balance;
+        buyExactOut(1 ether, 3 ether);
+        uint256 paid = ethBefore - address(this).balance;
+        uint256 fee = game.pot() + SWARM.balance + address(treasury).balance;
+        assertApproxEqAbs(fee, paid * 2500 / 10_000, 2, "25% of the spend, not 20%");
+        // The 2% base still splits 55/25/20 and the 23% surplus is all pot.
+        assertApproxEqAbs(SWARM.balance, paid * 200 / 10_000 * 2500 / 10_000, 2);
+        assertApproxEqAbs(address(treasury).balance, paid * 200 / 10_000 * 2000 / 10_000, 2);
+    }
+
+    // ---------------------------------------------------------------- price limits and partial fills
+
+    /// @dev The PoolManager wraps a hook's revert; this finds the hook's own error inside it.
+    function assertPartialFill(bytes memory reason) internal pure {
+        bytes4 want = MeatbagHook.PartialFill.selector;
+        bool found;
+        for (uint256 i = 0; i + 4 <= reason.length && !found; i++) {
+            found = reason[i] == want[0] && reason[i + 1] == want[1] && reason[i + 2] == want[2]
+                && reason[i + 3] == want[3];
+        }
+        assertTrue(found, "the swap did not revert with PartialFill");
+    }
+
+    function test_exactInputBuyCutShortByItsPriceLimitIsRefusedNotOvercharged() public {
+        vm.warp(block.timestamp + 1 hours);
+        uint160 limit = TickMath.getSqrtPriceAtTick(-60); // the pool can move about 3 ETH before this
+        try swapRouter.swap{value: 100 ether}(
+            key, SwapParams(true, -int256(100 ether), limit), PoolSwapTest.TestSettings(false, false), ""
+        ) {
+            fail();
+        } catch (bytes memory reason) {
+            assertPartialFill(reason);
+        }
+        assertEq(game.pot() + SWARM.balance + address(treasury).balance, 0, "no fee was taken");
+        assertEq(hook.volume(), 0, "no volume was recorded");
+        // The same order without a binding limit fills in full and pays exactly 2%.
+        buyExactIn(100 ether);
+        assertEq(game.pot() + SWARM.balance + address(treasury).balance, 2 ether);
+        assertEq(hook.volume(), 100 ether);
+    }
+
+    function test_exactOutputSellCutShortByItsPriceLimitIsRefusedNotOvercharged() public {
+        vm.warp(block.timestamp + 1 hours);
+        uint160 limit = TickMath.getSqrtPriceAtTick(60);
+        try swapRouter.swap(
+            key, SwapParams(false, int256(100 ether), limit), PoolSwapTest.TestSettings(false, false), ""
+        ) {
+            fail();
+        } catch (bytes memory reason) {
+            assertPartialFill(reason);
+        }
+        assertEq(game.pot() + SWARM.balance + address(treasury).balance, 0, "no fee was taken");
+        assertEq(hook.volume(), 0);
+        // Without the limit the seller gets exactly what they asked and the fee is 2% of the gross.
+        sellExactOut(1 ether);
+        assertEq(game.pot() + SWARM.balance + address(treasury).balance, uint256(1 ether) * 10_000 / 9_800 - 1 ether);
+    }
+
+    function test_swapsWhereEthIsUnspecifiedChargeOnTheSettledEthEvenWhenCutShort() public {
+        vm.warp(block.timestamp + 1 hours);
+        // Exact-input sell of 100 MEAT stopped at tick 60: the fee is 2% of the ETH that actually left.
+        uint256 ethBefore = address(this).balance;
+        swapRouter.swap(
+            key,
+            SwapParams(false, -int256(100 ether), TickMath.getSqrtPriceAtTick(60)),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
+        uint256 received = address(this).balance - ethBefore;
+        uint256 fee = game.pot() + SWARM.balance + address(treasury).balance;
+        assertLt(received + fee, 10 ether, "the limit stopped the sale early");
+        assertApproxEqAbs(fee, (received + fee) * 200 / 10_000, 2);
+        assertEq(hook.volume(), received + fee);
+    }
+
+    // ---------------------------------------------------------------- donations
+
+    function test_ethSentStraightToTheHookReachesThePot() public {
+        vm.warp(block.timestamp + 1 hours);
+        (bool ok,) = address(hook).call{value: 1 ether}("");
+        assertTrue(ok);
+        hook.distribute();
+        assertEq(address(hook).balance, 0, "nothing stays in the hook");
+        assertEq(game.pot(), 1 ether, "the donation is in the pot");
+        assertEq(SWARM.balance, 0);
+        assertEq(address(treasury).balance, 0);
+
+        // A donation beside a fee: the fee splits as always and the surplus is all pot.
+        (ok,) = address(hook).call{value: 0.5 ether}("");
+        assertTrue(ok);
+        buyExactIn(1 ether);
+        assertEq(game.pot(), 1 ether + 0.5 ether + 0.011 ether);
+        assertEq(SWARM.balance, 0.005 ether);
+        assertEq(address(treasury).balance, 0.004 ether);
+        assertEq(address(hook).balance, 0);
     }
 
     function test_sellExactInputTakesTwoPercentOfTheEthOut() public {
@@ -179,8 +280,11 @@ contract MeatbagHookTest is HookTestBase {
 
     function test_decayAppliesToExactOutputBuysToo() public {
         vm.warp(hook.launchedAt() + 15 minutes); // 13.5%
+        uint256 ethBefore = address(this).balance;
         buyExactOut(1 ether, 3 ether);
+        uint256 paid = ethBefore - address(this).balance;
         uint256 fee = game.pot() + SWARM.balance + address(treasury).balance;
+        assertApproxEqAbs(fee, paid * 1350 / 10_000, 2, "13.5% of the spend");
         uint256 base = SWARM.balance * 10_000 / 2500;
         assertApproxEqRel(fee, base * 1350 / 200, 1e15);
     }

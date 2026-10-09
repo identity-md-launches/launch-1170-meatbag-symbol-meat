@@ -47,6 +47,10 @@ contract MeatbagHook is IHooks, IUnlockCallback {
     error NotEthPair();
     error NotThisPool();
     error NothingToRedeem();
+    /// @notice The pool stopped at the swap's price limit (or ran out of liquidity) and moved less ETH
+    /// than the fee was priced on. When ETH is the specified currency the fee is fixed before the swap
+    /// and cannot be refunded inside it, so the swap is refused rather than overcharged.
+    error PartialFill(uint256 pricedEth, uint256 settledEth);
 
     uint256 public constant BASE_FEE_BPS = 200;
     uint256 public constant START_FEE_BPS = 2500;
@@ -78,7 +82,8 @@ contract MeatbagHook is IHooks, IUnlockCallback {
     PoolId public poolId;
     /// @notice When the pool opened; the buy-fee decay runs from here.
     uint256 public launchedAt;
-    /// @notice ETH volume: the ETH amount each swap's fee was charged on (a buyer's ETH in, or the ETH the pool paid out).
+    /// @notice ETH volume: the settled ETH each swap's fee was charged on (a buyer's ETH in, fee included,
+    /// or the ETH the pool paid a seller before the fee).
     uint256 public volume;
     /// @notice ETH owed to the pot, the swarm and the treasury but not yet held as ETH (claims pending).
     uint256 public owedPot;
@@ -109,6 +114,8 @@ contract MeatbagHook is IHooks, IUnlockCallback {
         assert(address(game) == predictedGame);
     }
 
+    /// @notice Takes the fee ETH the PoolManager pays out. ETH anyone else sends here is a donation and
+    /// reaches the pot on the next swap or `distribute()`.
     receive() external payable {}
 
     // ------------------------------------------------------------------ permissions
@@ -235,7 +242,10 @@ contract MeatbagHook is IHooks, IUnlockCallback {
     }
 
     /// @notice When ETH is the unspecified currency (exact-output buy, exact-input sell) the fee is taken
-    /// here from the ETH the pool moved. Either way the fee is then settled in ETH and split.
+    /// here from the ETH the pool settled. When ETH was the specified currency the fee fixed in
+    /// `beforeSwap` is checked against the ETH the pool settled: a swap the price limit cut short is
+    /// refused (`PartialFill`) rather than charged on ETH that never moved. Either way the fee is then
+    /// settled in ETH and split.
     function afterSwap(address, PoolKey calldata, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         onlyPoolManager
@@ -243,22 +253,32 @@ contract MeatbagHook is IHooks, IUnlockCallback {
     {
         bool buy = params.zeroForOne;
         bool exactIn = params.amountSpecified < 0;
-        uint256 rate = buy ? buyFeeBps() : BASE_FEE_BPS;
         uint256 fee;
         uint256 ethMoved;
         int128 unspecifiedDelta;
+        int128 amount0 = delta.amount0();
+        uint256 poolEth = amount0 < 0 ? uint256(uint128(-amount0)) : uint256(uint128(amount0));
 
         if (buy == exactIn) {
             assembly ("memory-safe") {
                 fee := tload(FEE_SLOT)
                 tstore(FEE_SLOT, 0)
             }
-            ethMoved = exactIn ? uint256(-params.amountSpecified) : uint256(params.amountSpecified) + fee;
-            if (!exactIn) rate = BASE_FEE_BPS;
+            // Exact-input buy: the pool should have taken the ETH in minus the fee. Exact-output sell:
+            // the pool should have paid the ETH out plus the fee. Anything less is a partial fill.
+            uint256 priced = exactIn ? uint256(-params.amountSpecified) - fee : uint256(params.amountSpecified) + fee;
+            if (poolEth != priced) revert PartialFill(priced, poolEth);
+            ethMoved = exactIn ? poolEth + fee : poolEth;
+        } else if (buy) {
+            // Exact-output buy: the buyer pays the pool's ETH plus the fee, and the fee is `rate` of that
+            // total, as it is for an exact-input buy.
+            uint256 rate = buyFeeBps();
+            fee = poolEth * rate / (10_000 - rate);
+            ethMoved = poolEth + fee;
+            unspecifiedDelta = int128(uint128(fee));
         } else {
-            int128 amount0 = delta.amount0();
-            uint256 poolEth = amount0 < 0 ? uint256(uint128(-amount0)) : uint256(uint128(amount0));
-            fee = poolEth * rate / 10_000;
+            // Exact-input sell: 2% of the ETH that left the pool.
+            fee = poolEth * BASE_FEE_BPS / 10_000;
             ethMoved = poolEth;
             unspecifiedDelta = int128(uint128(fee));
         }
@@ -306,7 +326,8 @@ contract MeatbagHook is IHooks, IUnlockCallback {
     }
 
     /// @notice Pushes whatever ETH this hook holds to the pot, the swarm and the treasury in the order
-    /// owed. Anyone may call it; a swarm wallet that could not receive ETH is retried here.
+    /// owed; anything above what is owed (ETH sent here directly) goes to the pot. Anyone may call it; a
+    /// swarm wallet that could not receive ETH is retried here.
     function distribute() external {
         _distribute();
     }
@@ -347,9 +368,12 @@ contract MeatbagHook is IHooks, IUnlockCallback {
         uint256 toTreasury = owedTreasury < balance ? owedTreasury : balance;
         balance -= toTreasury;
         uint256 toSwarm = owedSwarm < balance ? owedSwarm : balance;
+        balance -= toSwarm;
+        owedPot -= toPot;
+        // Whatever is left is owed to nobody: a donation sent straight to the hook. The pot takes it.
+        toPot += balance;
 
         if (toPot > 0) {
-            owedPot -= toPot;
             (bool ok,) = address(game).call{value: toPot}("");
             require(ok, "pot transfer failed");
         }

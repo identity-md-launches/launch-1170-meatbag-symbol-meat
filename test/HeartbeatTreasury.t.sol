@@ -35,10 +35,33 @@ contract HeartbeatTreasuryTest is Test {
         assertEq(treasury.fundNextRun(), 0.01 ether);
     }
 
-    function test_sendsWhatItHasWhenBelowTheCap() public {
+    function test_sendsWhatItHasWhenBelowTheCapAndClosesForAProportionalTime() public {
         vm.deal(address(treasury), 0.003 ether);
         assertEq(treasury.fundNextRun(), 0.003 ether);
         assertEq(address(treasury).balance, 0);
+        assertEq(treasury.nextRunAt(), block.timestamp + 12 hours * 3 / 10, "30% of a run closes 30% of 12 h");
+        vm.deal(address(treasury), 0.007 ether);
+        vm.expectRevert(abi.encodeWithSelector(HeartbeatTreasury.TooSoon.selector, treasury.nextRunAt()));
+        treasury.fundNextRun();
+        vm.warp(treasury.nextRunAt());
+        assertEq(treasury.fundNextRun(), 0.007 ether);
+        assertEq(treasury.nextRunAt(), block.timestamp + 12 hours * 7 / 10);
+    }
+
+    function test_aDustRunCannotUseUpTheHeartbeatSlot() public {
+        vm.deal(address(treasury), 2e11);
+        vm.prank(address(0xBAD));
+        assertEq(treasury.fundNextRun(), 2e11);
+        assertEq(treasury.nextRunAt(), block.timestamp, "dust closes the treasury for no time at all");
+
+        // Fees arrive: the full run is available at once, and only then does the 12 h window start.
+        vm.deal(address(treasury), 0.04 ether);
+        uint256 before = SWARM.balance;
+        assertEq(treasury.fundNextRun(), 0.01 ether);
+        assertEq(SWARM.balance - before, 0.01 ether);
+        assertEq(treasury.nextRunAt(), block.timestamp + 12 hours);
+        vm.expectRevert(abi.encodeWithSelector(HeartbeatTreasury.TooSoon.selector, block.timestamp + 12 hours));
+        treasury.fundNextRun();
     }
 
     function test_revertsWhenEmpty() public {

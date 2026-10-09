@@ -48,19 +48,19 @@
   <ul id="entries"><li class="dim">loading…</li></ul>
 
   <h2>Judge</h2>
-  <p>When a round closes, anyone can press this. It pays 0.5 IMD from your wallet to the IMD Intake for a 7-agent panel (quorum 4) and pays you 3% of the pot for the trouble. The panel's signed answer settles on chain.</p>
-  <p><button id="approveBtn">Approve 0.5 IMD</button> <button id="judgeBtn">judge()</button> <button id="hungBtn">declare hung jury</button> <span id="judgeInfo" class="dim"></span></p>
+  <p>When a round closes, anyone can press this. It pays the IMD Intake's price (<span id="judgePrice">0.5</span> IMD) from your wallet for a 7-agent panel (quorum 4) and pays you 3% of the pot for the trouble. The panel's signed answer settles on chain.</p>
+  <p><button id="approveBtn">Approve IMD</button> <button id="judgeBtn">judge()</button> <button id="hungBtn">declare hung jury</button> <button id="sunsetBtn" hidden>sunset()</button> <span id="judgeInfo" class="dim"></span></p>
 
   <h2>Verdicts, hung juries and the sunset rule</h2>
   <ul id="verdicts"><li class="dim">loading…</li></ul>
-  <p class="dim">A hung jury (the panel could not agree, or nobody judged in time) carries the pot over. After 7 unsettled rounds in a row, everyone who entered those rounds splits the pot equally.</p>
+  <p class="dim">A hung jury (the panel could not agree, nobody judged in time, or the Intake would not take the request) carries the pot over. After 7 unsettled rounds in a row, everyone who entered those rounds splits the pot equally; if the seventh came back from the panel, anyone presses sunset() to split it.</p>
 
   <h2>Your claims</h2>
   <p>Owed to you: <b id="claimable">—</b> ETH <button id="claimBtn">claim()</button></p>
   <p class="dim">Sunset shares: <span id="sunsets">—</span></p>
 
   <h2>Buy / sell MEAT</h2>
-  <p>MEAT trades on Uniswap v4 against ETH with a 2% hook fee taken in ETH on every trade (buys in the first 30 minutes after launch paid more, decaying to 2%). 55% of the fee feeds the pot, 25% pays the swarm's wallet and 20% funds the 12-hour heartbeat.</p>
+  <p>MEAT trades on Uniswap v4 against ETH with a 2% hook fee taken in ETH on every trade (buys in the first 30 minutes after launch paid more, decaying to 2%). 55% of the fee feeds the pot, 25% pays the swarm's wallet and 20% funds the 12-hour heartbeat. A trade whose price limit would cut it short is refused rather than charged on ETH that never moved: trade without a binding limit, or for a smaller amount.</p>
   <p><a id="uniLink" href="#" target="_blank" rel="noopener">Open the MEAT/ETH pool on Uniswap</a> · token <code id="tokenAddr">—</code></p>
 
   <h2>The swarm's letters <span class="dim">— the official news channel</span></h2>
@@ -95,7 +95,8 @@ const GAME_ABI = [
   "function unsettledStreak() view returns (uint256)", "function claimable(address) view returns (uint256)",
   "function hasEntered(uint256,address) view returns (bool)", "function sunsetClaimed(uint256,address) view returns (bool)",
   "function enter(string) payable", "function judge() returns (bytes32)", "function declareHungJury()", "function claim()", "function claimSunset(uint256)",
-  "function PRICE() view returns (uint256)",
+  "function sunset()", "function sunsetDue() view returns (bool)", "function hungJuryAt() view returns (uint256)",
+  "function judgePrice() view returns (uint256)",
   "event Verdict(uint256 indexed day,uint256 indexed slot,address indexed winner,uint256 prize,bytes32 panelJobId,uint16 agreed)",
   "event HungJury(uint256 indexed day,uint256 streak)",
   "event Sunset(uint256 indexed firstDay,uint256 indexed lastDay,uint256 entrants,uint256 sharePerEntrant)",
@@ -150,7 +151,10 @@ async function load() {
     items.push(`<li>${line}</li>`);
   }
   $("verdicts").innerHTML = items.join("") || '<li class="dim">no rounds yet</li>';
-  $("judgeInfo").textContent = `unsettled streak: ${streak}/7`;
+  const [judgePrice, sunsetDue, hungAt] = await Promise.all([game.judgePrice(), game.sunsetDue(), game.hungJuryAt()]);
+  $("judgePrice").textContent = fmt(judgePrice, 2);
+  $("sunsetBtn").hidden = !sunsetDue;
+  $("judgeInfo").textContent = `unsettled streak: ${streak}/7` + (sunsetDue ? " · sunset due: press sunset()" : "") + (hungAt > 0n ? ` · hung jury can be declared ${new Date(Number(hungAt) * 1000).toUTCString()}` : "");
 
   // Letters.
   const logs = await herald.queryFilter(herald.filters.Message(), 0, "latest");
@@ -177,9 +181,10 @@ async function tx(fn) { try { status("confirm in your wallet…"); const t = awa
 
 $("connectBtn").addEventListener("click", connect);
 $("enterBtn").addEventListener("click", async () => { if (!signer) return connect(); const price = await game.nextSlotPrice(); tx(() => game.connect(signer).enter($("text").value, { value: price })); });
-$("approveBtn").addEventListener("click", async () => { if (!signer) return connect(); const imd = new ethers.Contract(CONFIG.IMD, ERC20_ABI, signer); tx(() => imd.approve(await game.getAddress(), await game.PRICE())); });
+$("approveBtn").addEventListener("click", async () => { if (!signer) return connect(); const imd = new ethers.Contract(CONFIG.IMD, ERC20_ABI, signer); tx(async () => imd.approve(await game.getAddress(), await game.judgePrice())); });
 $("judgeBtn").addEventListener("click", async () => { if (!signer) return connect(); tx(() => game.connect(signer).judge()); });
 $("hungBtn").addEventListener("click", async () => { if (!signer) return connect(); tx(() => game.connect(signer).declareHungJury()); });
+$("sunsetBtn").addEventListener("click", async () => { if (!signer) return connect(); tx(() => game.connect(signer).sunset()); });
 $("claimBtn").addEventListener("click", async () => { if (!signer) return connect(); tx(() => game.connect(signer).claim()); });
 
 load().catch((e) => status(e.message));

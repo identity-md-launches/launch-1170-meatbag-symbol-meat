@@ -16,7 +16,7 @@ tick spacing 60, opening market cap 10 ETH per the launch policy. Spec source: r
 | --- | --- | --- | --- |
 | `MeatbagToken` | `src/MeatbagToken.sol` | the launch factory | Standard fixed-supply ERC-20, name `MEATBAG`, symbol `MEAT`, 18 decimals, 10^27 minor units minted once to `msg.sender` (the factory). No constructor arguments. |
 | `MeatbagHook` | `src/MeatbagHook.sol` | the launch factory | The Uniswap v4 hook: a 2% ETH fee on every swap, settled in ETH inside the swap. Its constructor deploys the three contracts below. |
-| `HeartbeatTreasury` | `src/HeartbeatTreasury.sol` | the hook's constructor | Holds the heartbeat's 20%; `fundNextRun()` sends at most 0.01 ETH per 12 h to the swarm's wallet. |
+| `HeartbeatTreasury` | `src/HeartbeatTreasury.sol` | the hook's constructor | Holds the heartbeat's 20%; `fundNextRun()` sends at most 0.01 ETH per call to the swarm's wallet and closes for 12 h per full 0.01 ETH sent. |
 | `MeatbagHerald` | `src/MeatbagHerald.sol` | the hook's constructor | The only official channel: `event Message(address indexed to, string text)`, `to` = `0x200E710aCAA6A93bbc77146026328C40F1d60fB1`. |
 | `MeatbagGame` | `src/MeatbagGame.sol` | the hook's constructor | Daily rounds, entries, judging through the IMD Intake, EIP-712 attestation verification, pull claims, carry-over, sunset. |
 | `OracleAttestation` / `OracleAttestationConsumer` | `src/OracleAttestation.sol` | library / base | Copied verbatim from the oracle-consumer reference: the protocol's attestation struct, type hash and domain. |
@@ -74,8 +74,8 @@ that paid it, for both directions and for exact-input and exact-output swaps:
 
 | Swap | Specified currency | Where the fee is taken | Fee base |
 | --- | --- | --- | --- |
-| buy, exact input | ETH | `beforeSwap`, off the ETH in | the ETH the buyer sends |
-| buy, exact output | MEAT | `afterSwap`, added to the ETH the buyer owes | the ETH the pool took |
+| buy, exact input | ETH | `beforeSwap`, off the ETH in | everything the buyer pays (pool ETH + fee) |
+| buy, exact output | MEAT | `afterSwap`, added to the ETH the buyer owes | everything the buyer pays (pool ETH + fee), the same base as an exact-input buy |
 | sell, exact input | MEAT | `afterSwap`, off the ETH out | the ETH the pool paid out |
 | sell, exact output | ETH | `beforeSwap`, the pool pays out the gross | the gross ETH out, so the user receives exactly what they asked |
 
@@ -84,6 +84,16 @@ the rate decays linearly from 25% to 2% (`buyFeeBps()`), and everything above th
 pot. Every 2% base fee is split **55% pot / 25% `0xd01122bBfFd00fc96252c8b29867a5359a3bca13` (the
 swarm's wallet) / 20% heartbeat treasury**. Nobody can change any of these numbers.
 
+**Partial fills.** The fee is always charged on the ETH that settled. When ETH is the unspecified
+currency (exact-output buy, exact-input sell) `afterSwap` reads the settled ETH delta directly, so a swap
+the price limit cuts short pays on what moved. When ETH is the specified currency (exact-input buy,
+exact-output sell) the fee has to be fixed in `beforeSwap`, and v4 gives the hook no way to refund part
+of it to the swapper inside the swap. `afterSwap` therefore compares the settled ETH with the amount the
+fee was priced on and reverts `PartialFill(pricedEth, settledEth)` when they differ: the swap is refused
+rather than overcharged, and the swapper retries without a binding `sqrtPriceLimitX96` or for a smaller
+amount. Routers that use the min/max price limits (the Universal Router does) never hit this. Volume for
+the herald's milestones is likewise the settled ETH.
+
 Settlement: the hook ends every swap holding its fee as ETH. It `take`s native ETH when the
 PoolManager's ETH balance covers it, and `mint`s itself an ERC-6909 ETH claim when it does not (a fresh
 pool seeded with tokens only has no ETH before the first buy settles). Claims are redeemed on the next
@@ -91,7 +101,8 @@ swap that can cover them, or by anyone through `redeemClaims()`. The ETH is push
 (`receive` adds it to the pot) and to the treasury; the swarm's share is pushed with a plain call and,
 if that wallet ever cannot receive ETH, is kept owed and retried by the next swap or by anyone through
 `distribute()`. A rejecting swarm wallet therefore never halts swaps. The pot and the treasury are this
-project's own contracts and always accept ETH.
+project's own contracts and always accept ETH. ETH anyone sends straight to the hook is owed to nobody
+and is pushed to the pot by the next swap or `distribute()`; nothing can stay in the hook.
 
 ## The game
 
@@ -99,7 +110,9 @@ project's own contracts and always accept ETH.
   0x7E), 1 to 200 bytes, at most 40 entries per round, one per wallet per round. Slot k costs exactly
   k × 0.001 ETH (`nextSlotPrice()`), paid into the pot. Texts are stored on chain and emitted.
 - `judge()`: once the oldest unjudged round has closed, anyone calls it. The caller must hold and have
-  approved 0.5 IMD (`0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7`); the game pulls it, approves the IMD
+  approved `judgePrice()` IMD (`0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7`): the Intake's current
+  `priceOf(action, IMD)`, 0.5 IMD today, falling back to 0.5 IMD if the Intake answers zero or has no
+  price list, so a moved price needs no redeploy. The game pulls it, approves the IMD
   Intake (`0x1397434cd35e8a9C8aC312A61D3A285EB31dea56`) and calls `request` with action
   `bytes32("oracle.request@oracle-1")`, answer type `uint256` (the winning entry index), evidence
   `panel`, panelSize 7, quorum 4, `validForSeconds` 86400, `allowAmbiguous` true, the entries in
@@ -118,9 +131,19 @@ project's own contracts and always accept ETH.
 - **No verdict** (panel disagreed, body refused, nobody delivered): after `VERDICT_TIMEOUT`
   (86400 + 3600 s) anyone calls `declareHungJury()`, or the next `judge()` sweeps it. The pot carries
   over.
+- **No request** (the Intake refuses `request`, say because `oracle-1` was retired, or nobody judged):
+  a closed round that is still unjudged `VERDICT_TIMEOUT` after it closed (`hungJuryAt()`, 01:00 UTC
+  two days after the round's day) may also be declared hung by anyone through `declareHungJury()`. It
+  counts toward the sunset like any hung jury, so no state of the Intake can strand the pot. `judge()`
+  still works on such a round until it is hung.
 - **Sunset rule**: after 7 unsettled rounds in a row (rounds with entries, in order), the pot is split
   equally among every entrant of those 7 rounds as pull claims (`claimSunset(day)`), so a dead or
-  rotated oracle signer can never strand the pot. The streak resets on any verdict or sunset.
+  rotated oracle signer can never strand the pot. The streak resets on any verdict or sunset. When the
+  seventh round is hung by `declareHungJury()` or a `judge()` sweep the split happens in that call. When
+  it is hung by the oracle callback (a weak panel or an out-of-range index), the callback only marks the
+  round hung, because the split does not fit the writer's 200,000 gas stipend; `sunsetDue()` turns true
+  and anyone calls `sunset()`, and `judge()` and `declareHungJury()` settle a due sunset before they
+  touch another round, so the seven rounds of the split are always exactly the streak's.
 - `claim()` pulls prizes and keeper rewards. Rounds without entries do not exist and are skipped.
 - Donations: any ETH sent to the game joins the pot.
 
@@ -135,10 +158,13 @@ project news goes out only as `Message` events.
 
 ## The heartbeat
 
-`HeartbeatTreasury.fundNextRun()` is public, callable at most once per 12 hours, and sends
-`min(balance, 0.01 ETH)` to the swarm's wallet, which funds the IMD job schedule (cadence PT12H) that
-improves the site or adds opt-in features. The treasury holds nothing but its 20% share and can touch
-nothing else: not the pot, the rates, the supply or any holder's funds.
+`HeartbeatTreasury.fundNextRun()` is public and sends `min(balance, 0.01 ETH)` to the swarm's wallet,
+which funds the IMD job schedule (cadence PT12H) that improves the site or adds opt-in features. Each
+call closes the treasury for `12 h × amount / 0.01 ETH` (`nextRunAt()`): a full run closes it for 12
+hours, a run that only found dust closes it for nearly no time, so nobody can use up a heartbeat's slot
+by calling it while the treasury is almost empty. Over any stretch of time it sends at most 0.01 ETH per
+12 hours plus one run. The treasury holds nothing but its 20% share and can touch nothing else: not the
+pot, the rates, the supply or any holder's funds.
 
 ## The site
 
@@ -172,22 +198,39 @@ The game and herald hold no MEAT and were allocated none; the pot is ETH only.
 
 ## Assumptions and open items
 
-- **Fixed protocol values.** The brief forbids an owner, so the intake, IMD, action id, price and
-  signer are fixed (the hook hands them to the game as immutables). This deliberately departs from the
-  oracle-consumer reference's "owner-settable" advice; if IMD rotates its signer, retires `oracle-1` or
-  moves the price, rounds stop settling and the sunset rule returns the pot to entrants.
+- **Fixed protocol values.** The brief forbids an owner, so the intake, IMD, action id and signer are
+  fixed (the hook hands them to the game as immutables); only the price is read live from the Intake.
+  This deliberately departs from the oracle-consumer reference's "owner-settable" advice. If IMD
+  rotates its signer or retires `oracle-1`, rounds stop settling: requests time out or are refused,
+  each closed round is declared hung after `VERDICT_TIMEOUT`, and after seven the sunset rule returns
+  the pot to those rounds' entrants. Trading fees keep feeding the pot meanwhile, and the next sunset
+  returns them too.
 - **"Repaid from the pot plus 3%"** was read as: the keeper receives 3% of the pot (in ETH, as a pull
-  claim) at request time, which is their repayment for the 0.5 IMD and gas. The pot cannot repay IMD
-  in kind without a price feed.
+  claim) at request time, which is their repayment for the IMD and gas. The pot holds ETH and the cost
+  is IMD; repaying it in kind needs an IMD/ETH rate that no contract here has and no owner could set.
+  While the pot is below about 17 × the IMD price in ETH, judging costs the caller more than it pays;
+  the swarm's heartbeat is expected to judge in that case. If the requester wants a fixed ETH
+  reimbursement instead, its amount is theirs to name.
 - **Pot record** is measured at judging time (before the keeper's 3%), so the herald posts at most one
   record letter per round rather than one per swap.
-- **Exact-output buys** pay 2% of the ETH the pool took (1.96% of total spend); exact-output sells
-  receive exactly the ETH asked and the pool pays the grossed-up amount so the fee is 2% of what left
-  the pool.
-- **Volume** for herald milestones is the ETH amount each fee was charged on.
-- **Sunset inside the callback.** If the seventh unsettled round is settled as hung *inside* the oracle
-  callback, the sunset loop may exceed the 200,000 gas stipend; the callback then reverts, the request
-  times out, and `declareHungJury()` performs the same sunset in an ordinary transaction.
+- **Buy fee base.** Buys pay the buy rate on everything the buyer pays, whether the swap is exact
+  input or exact output (an exact-output buy at launch pays 25% of the spend, not 20%). Sells pay 2% of
+  the ETH that left the pool; exact-output sells receive exactly the ETH asked and the pool pays the
+  grossed-up amount.
+- **Price-limited swaps** with ETH as the specified currency are refused (`PartialFill`) rather than
+  charged on the requested amount; see "Partial fills" above.
+- **Volume** for herald milestones is the settled ETH each fee was charged on.
+- **Sunset from the callback.** The oracle callback never runs the sunset loop (it would not fit the
+  200,000 gas stipend); it marks the round hung and leaves the split to `sunset()`, `judge()` or
+  `declareHungJury()`, any of which anyone may call at once.
+- **One funder can fill a round.** The brief's limits are per wallet (one entry) and per round (40
+  slots): forty wallets can buy a whole day for 0.82 ETH at 00:00 UTC and are then certain to hold the
+  winning entry, whichever the panel picks, so capturing a round pays once the pot is above about
+  0.24 ETH. Sunset shares are per entry and can be captured the same way. This follows the brief's
+  parameters and is recorded as a design property, not changed.
+- **The swarm wallet's free text.** `MeatbagHerald.post(text)` lets `0xd011…bca13` post any letter,
+  because the brief requires each heartbeat job to end with a Message on what it built. Whoever holds
+  that key can publish any "official" letter, and nothing can revoke it: a trust assumption.
 - **Independent review.** This work holds other people's funds. The brief's "independent review" item
   is an operational responsibility: it needs a separate adversarial review by an independent
   contributor before release. Tests passing is not an audit. Slither/Mythril were not run here (not
@@ -199,25 +242,33 @@ The game and herald hold no MEAT and were allocated none; the pot is ETH only.
 | Who | What |
 | --- | --- |
 | Launch factory | Deploys `MeatbagToken` then `MeatbagHook` (mined address), initializes the pool, seeds liquidity. |
-| Anyone | `judge()` after each round closes (needs 0.5 IMD, earns 3% of the pot); `declareHungJury()` after a timeout; `redeemClaims()` / `distribute()` if ETH ever sits as claims or owed; `fundNextRun()` every 12 h. |
+| Anyone | `judge()` after each round closes (needs `judgePrice()` IMD, earns 3% of the pot); `declareHungJury()` once `hungJuryAt()` has passed; `sunset()` when `sunsetDue()`; `redeemClaims()` / `distribute()` if ETH ever sits as claims or owed; `fundNextRun()` every 12 h. |
 | Swarm wallet `0xd011…bca13` | Receives 25% of fees and the heartbeat funding; runs the PT12H job; ends each job with `herald.post(text)`; hosts and updates the site. |
 | Nobody | Can change fees, splits, recipients, the pot, the signer or the supply. |
 
 ## Tests
 
-`forge build`, `forge test` and `forge fmt --check` pass offline with the pinned compiler (60 tests).
+`forge build`, `forge test` and `forge fmt --check` pass offline with the pinned compiler (72 tests).
 
 - `test/MeatbagHook.t.sol`: permissions vs. mined address; callbacks refuse non-manager callers;
   factory-only, once-only, ETH-only initialization; fee on buy/sell × exact-in/exact-out with exact
-  55/25/20 splits; decay curve and launch-time surplus to the pot; fuzzed 2% invariant; claim path on a
-  fresh manager seeded with tokens only, redemption on the next swap and via `redeemClaims()`; herald
-  first-trade and volume milestones; no admin surface.
+  55/25/20 splits; exact-output buys pay the buy rate on the spend, at launch and during the decay;
+  decay curve and launch-time surplus to the pot; fuzzed 2% invariant; price-limited exact-input buys
+  and exact-output sells revert `PartialFill` and take no fee, while price-limited exact-input sells
+  pay on the settled ETH; ETH sent straight to the hook reaches the pot; claim path on a fresh manager
+  seeded with tokens only, redemption on the next swap and via `redeemClaims()`; herald first-trade and
+  volume milestones; no admin surface.
 - `test/MeatbagGame.t.sol`: slot pricing, 200-byte and ASCII limits, duplicates, 40-entry cap, new day;
-  judge pays the intake, rewards the keeper, body contents and sanitising; verdict pays 80% and carries
-  20%; wrong sender, unknown id, wrong signer, wrong domain, tampered answer, expired, not-yet-valid,
-  replay (same id and same attestation under a new id); weak panel / bad index = hung jury; timeout →
-  hung → carry-over; judge sweeps a timed-out round; seven unsettled rounds → sunset shares and claims;
-  streak reset; pot-record letters; no admin surface.
+  judge pays the intake, rewards the keeper, body contents and sanitising; judge pulls the Intake's
+  current price and falls back to 0.5 IMD without a price list; verdict pays 80% and carries 20%; wrong
+  sender, unknown id, wrong signer, wrong domain, tampered answer, expired, not-yet-valid, replay (same
+  id and same attestation under a new id); weak panel / bad index = hung jury; timeout → hung →
+  carry-over; judge sweeps a timed-out round; a round the Intake refuses is hung after the timeout and
+  seven such rounds sunset the pot; seven unsettled rounds → sunset shares and claims; the seventh hung
+  verdict from the oracle fits the 200k stipend and leaves the sunset to `sunset()`, which `judge()`
+  and `declareHungJury()` also settle first; streak reset; pot-record letters; no admin surface.
+- `test/HeartbeatTreasury.t.sol`: the 0.01 ETH cap, the 12 h window, proportional closing for partial
+  runs, a dust run cannot block the next heartbeat, anyone may call, no admin surface.
 - `test/OracleConsumerConformance.t.sol`: the protocol's vector digest, callback selector, the
   protocol's own signature delivered under 200k gas, and a fresh signature from the vector key.
 - `test/MeatbagHerald.t.sol`, `test/HeartbeatTreasury.t.sol`, `test/MeatbagToken.t.sol`,

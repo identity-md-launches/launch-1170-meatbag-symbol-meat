@@ -2,11 +2,24 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
-import {MeatbagGame} from "../src/MeatbagGame.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {MeatbagGame, IIntake} from "../src/MeatbagGame.sol";
 import {MeatbagHerald} from "../src/MeatbagHerald.sol";
 import {OracleAttestation, OracleAttestationConsumer} from "../src/OracleAttestation.sol";
 import {MockIntake} from "./mocks/MockIntake.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+
+/// @dev An intake that takes requests but has no `priceOf` at all.
+contract PricelessIntake is IIntake {
+    function request(bytes32, bytes calldata, Callback calldata, address asset, uint256 amount)
+        external
+        payable
+        returns (bytes32)
+    {
+        IERC20(asset).transferFrom(msg.sender, address(this), amount);
+        return keccak256("priceless");
+    }
+}
 
 contract MeatbagGameTest is Test {
     event Message(address indexed to, string text);
@@ -216,6 +229,37 @@ contract MeatbagGameTest is Test {
 
         vm.expectRevert(abi.encodeWithSelector(MeatbagGame.VerdictPending.selector, day));
         judgeAs(keeper);
+    }
+
+    function test_judgePullsTheIntakesCurrentPrice() public {
+        intake.setPrice(0.7 ether);
+        assertEq(game.judgePrice(), 0.7 ether);
+        enterAs(alice, "a");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        assertEq(imd.balanceOf(address(intake)), 0.7 ether, "the moved price is what the intake gets");
+        assertEq(imd.balanceOf(keeper), 99.3 ether);
+        (,,,,, uint256 amount) = intake.requests(id);
+        assertEq(amount, 0.7 ether);
+    }
+
+    function test_judgePriceFallsBackToHalfAnImdWhenTheIntakeHasNoPriceList() public {
+        intake.setPrice(0);
+        assertEq(game.judgePrice(), game.PRICE(), "a zero price means the brief's 0.5 IMD");
+
+        PricelessIntake priceless = new PricelessIntake();
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
+        MeatbagHerald h = new MeatbagHerald(predicted);
+        MeatbagGame g = new MeatbagGame(h, address(priceless), address(imd), signer);
+        assertEq(g.judgePrice(), 0.5 ether);
+        vm.prank(keeper);
+        imd.approve(address(g), type(uint256).max);
+        vm.prank(alice);
+        g.enter{value: 0.001 ether}("a");
+        nextDay();
+        vm.prank(keeper);
+        g.judge();
+        assertEq(imd.balanceOf(address(priceless)), 0.5 ether);
     }
 
     function test_judgeBodyNeutralisesQuotesAndBackslashes() public {
@@ -456,6 +500,146 @@ contract MeatbagGameTest is Test {
         vm.prank(bob);
         game.claimSunset(days_[0]);
         assertEq(address(game).balance, game.pot() + game.totalClaimable());
+    }
+
+    function test_aRoundTheIntakeRefusesIsDeclaredHungAfterTheTimeoutSoThePotIsNeverStranded() public {
+        (bool ok,) = address(game).call{value: 5 ether}("");
+        assertTrue(ok);
+        uint256 day = game.today();
+        enterAs(alice, "a");
+        intake.setRefusing(true);
+
+        // Open rounds cannot be hung while today, nor in the window a keeper has to judge them.
+        vm.expectRevert(abi.encodeWithSelector(MeatbagGame.NotTimedOut.selector, day));
+        game.declareHungJury();
+        nextDay();
+        vm.expectRevert(MockIntake.ActionNotSold.selector);
+        judgeAs(keeper);
+        vm.expectRevert(abi.encodeWithSelector(MeatbagGame.NotTimedOut.selector, day));
+        game.declareHungJury();
+        assertEq(game.hungJuryAt(), (day + 1) * 1 days + game.VERDICT_TIMEOUT());
+
+        vm.warp(game.hungJuryAt() - 1);
+        vm.expectRevert(abi.encodeWithSelector(MeatbagGame.NotTimedOut.selector, day));
+        game.declareHungJury();
+        vm.warp(block.timestamp + 1);
+        game.declareHungJury();
+
+        assertEq(uint8(game.round(day).status), uint8(MeatbagGame.Status.Hung));
+        assertEq(game.cursor(), 1);
+        assertEq(game.unsettledStreak(), 1);
+        assertEq(game.pot(), 5.001 ether, "the pot carries over untouched");
+        assertEq(imd.balanceOf(keeper), 100 ether, "the keeper paid nothing");
+        assertTrue(herald.sent(5), "hung jury announced");
+        assertEq(game.hungJuryAt(), 0, "nothing is waiting");
+    }
+
+    function test_sevenRefusedRoundsSunsetThePotToTheirEntrants() public {
+        (bool ok,) = address(game).call{value: 7 ether}("");
+        assertTrue(ok);
+        intake.setRefusing(true);
+        uint256[] memory days_ = new uint256[](7);
+        for (uint256 i = 0; i < 7; i++) {
+            days_[i] = game.today();
+            enterAs(alice, "a");
+            enterAs(bob, "b");
+            vm.warp(game.hungJuryAt());
+            vm.prank(keeper);
+            vm.expectRevert(MockIntake.ActionNotSold.selector);
+            game.judge();
+            game.declareHungJury();
+        }
+        uint256 share = (7 ether + 7 * 0.003 ether) / 14;
+        assertEq(game.unsettledStreak(), 0);
+        for (uint256 i = 0; i < 7; i++) {
+            assertEq(game.round(days_[i]).sunsetShare, share);
+        }
+        uint256 before = alice.balance;
+        vm.startPrank(alice);
+        for (uint256 i = 0; i < 7; i++) {
+            game.claimSunset(days_[i]);
+        }
+        vm.stopPrank();
+        assertEq(alice.balance - before, share * 7);
+        assertEq(address(game).balance, game.pot() + game.totalClaimable());
+    }
+
+    /// @dev Hangs `n` one-entry rounds through a request that times out, leaving the streak at `n`.
+    function hangRounds(uint256 n) internal {
+        for (uint256 i = 0; i < n; i++) {
+            enterAs(alice, "a");
+            nextDay();
+            judgeAs(keeper);
+            vm.warp(block.timestamp + game.VERDICT_TIMEOUT());
+            game.declareHungJury();
+        }
+    }
+
+    function test_seventhHungVerdictFromTheOracleFitsTheStipendAndLeavesTheSunsetToAnyone() public {
+        (bool ok,) = address(game).call{value: 7 ether}("");
+        assertTrue(ok);
+        hangRounds(6);
+        assertEq(game.unsettledStreak(), 6);
+        vm.expectRevert(MeatbagGame.NoSunsetDue.selector);
+        game.sunset();
+
+        uint256 day = game.today();
+        enterAs(alice, "a");
+        enterAs(bob, "b");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        OracleAttestation.Attestation memory a = attestation(id, 0);
+        a.agreed = 3; // below quorum: hung
+        assertTrue(intake.deliver(id, a, sign(SIGNER_KEY, a)), "the callback fits in 200,000 gas");
+
+        assertEq(uint8(game.round(day).status), uint8(MeatbagGame.Status.Hung));
+        assertEq(game.unsettledStreak(), 7);
+        assertTrue(game.sunsetDue());
+        assertEq(game.round(day).sunsetShare, 0, "the split waits for an ordinary transaction");
+
+        uint256 pot = game.pot();
+        vm.prank(address(0xBEEF));
+        game.sunset();
+        assertEq(game.unsettledStreak(), 0);
+        assertFalse(game.sunsetDue());
+        uint256 share = pot / 8;
+        assertEq(game.round(day).sunsetShare, share);
+        assertEq(game.round(game.roundDays(0)).sunsetShare, share);
+        vm.prank(bob);
+        game.claimSunset(day);
+        vm.expectRevert(MeatbagGame.NoSunsetDue.selector);
+        game.sunset();
+        assertEq(address(game).balance, game.pot() + game.totalClaimable());
+    }
+
+    function test_judgeAndDeclareHungJurySettleADueSunsetBeforeTouchingTheNextRound() public {
+        (bool ok,) = address(game).call{value: 7 ether}("");
+        assertTrue(ok);
+        hangRounds(6);
+        enterAs(alice, "a");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        OracleAttestation.Attestation memory a = attestation(id, 9); // out of range: hung
+        assertTrue(intake.deliver(id, a, sign(SIGNER_KEY, a)));
+        assertTrue(game.sunsetDue());
+
+        // judge() on the next round settles the sunset first (on the pot as it stands then, the new
+        // entry included), then asks the panel about the new round.
+        uint256 next = game.today();
+        enterAs(bob, "b");
+        nextDay();
+        uint256 pot = game.pot();
+        bytes32 id2 = judgeAs(keeper);
+        assertEq(game.unsettledStreak(), 0);
+        assertEq(game.round(game.roundDays(0)).sunsetShare, pot / 7);
+        assertEq(game.round(next).sunsetShare, 0, "the new round is not part of the sunset");
+        assertEq(uint8(game.round(next).status), uint8(MeatbagGame.Status.Pending));
+        assertEq(game.pendingDay(id2), next);
+
+        // And declareHungJury() does the same when the streak builds up again through callbacks.
+        vm.warp(block.timestamp + game.VERDICT_TIMEOUT());
+        game.declareHungJury();
+        assertEq(game.unsettledStreak(), 1);
     }
 
     function test_aVerdictResetsTheStreak() public {

@@ -20,6 +20,11 @@ interface IIntake {
         returns (bytes32 requestId);
 }
 
+/// @notice The intake's price list, read separately so an intake without it still takes requests.
+interface IIntakePricing {
+    function priceOf(bytes32 action, address asset) external view returns (uint256);
+}
+
 /// @title The MEATBAG game: a daily reverse Turing test
 /// @notice Every UTC day humans write up to 200 ASCII characters proving they are human. Slot k of the
 /// day costs k x 0.001 ETH into the pot, at most 40 slots, one per wallet. Once the day closes anyone
@@ -30,9 +35,11 @@ interface IIntake {
 /// the entrants of those rounds split the pot equally (the sunset rule). The judge caller is paid 3% of
 /// the pot as a pull claim the moment the request is made.
 ///
-/// There is no owner, admin, upgrade or pause. The intake, the IMD token, the action id, the price and
-/// the signer are the values the launch brief gave for Ethereum mainnet, fixed for good: if IMD rotates
-/// its signer or retires `oracle-1`, rounds stop settling and the sunset rule returns the pot.
+/// There is no owner, admin, upgrade or pause. The intake, the IMD token, the action id and the signer
+/// are the values the launch brief gave for Ethereum mainnet, fixed for good; the price is read from the
+/// intake at judging time (0.5 IMD when it cannot be read). If IMD rotates its signer or retires
+/// `oracle-1`, rounds stop settling: a round nobody can judge is declared hung `VERDICT_TIMEOUT` after it
+/// closed, so the sunset rule still returns the pot.
 contract MeatbagGame is OracleAttestationConsumer {
     using SafeERC20 for IERC20;
     using Strings for uint256;
@@ -43,6 +50,7 @@ contract MeatbagGame is OracleAttestationConsumer {
     address public immutable INTAKE;
     address public immutable IMD;
     bytes32 public constant ACTION = bytes32("oracle.request@oracle-1");
+    /// @notice The price the brief names, used when the intake does not answer `priceOf`.
     uint256 public constant PRICE = 0.5 ether;
 
     // ---- game constants ----
@@ -54,7 +62,9 @@ contract MeatbagGame is OracleAttestationConsumer {
     uint16 public constant PANEL_SIZE = 7;
     uint16 public constant QUORUM = 4;
     uint256 public constant VALID_FOR_SECONDS = 86_400;
-    /// @notice How long a request may stay pending before anyone may declare the jury hung.
+    /// @notice How long a request may stay pending before anyone may declare the jury hung. A closed
+    /// round that nobody managed to judge for this long (the intake refuses the request, for instance)
+    /// may be declared hung too, so the sunset rule is always reachable.
     uint256 public constant VERDICT_TIMEOUT = VALID_FOR_SECONDS + 1 hours;
     uint256 public constant SUNSET_AFTER = 7;
 
@@ -116,6 +126,7 @@ contract MeatbagGame is OracleAttestationConsumer {
     error VerdictPending(uint256 day);
     error NotPending(uint256 day);
     error NotTimedOut(uint256 day);
+    error NoSunsetDue();
     error NotTheIntake();
     error UnknownRequest(bytes32 requestId);
     error NothingToClaim();
@@ -213,16 +224,37 @@ contract MeatbagGame is OracleAttestationConsumer {
         return cursor < roundDays.length ? roundDays[cursor] : 0;
     }
 
+    /// @notice What `judge()` pulls from its caller: the intake's current price of the action in IMD,
+    /// or the brief's 0.5 IMD when the intake does not answer `priceOf`.
+    function judgePrice() public view returns (uint256) {
+        try IIntakePricing(INTAKE).priceOf(ACTION, IMD) returns (uint256 p) {
+            if (p != 0) return p;
+        } catch {}
+        return PRICE;
+    }
+
+    /// @notice When the round at the cursor may be declared a hung jury: a pending request's timeout, or
+    /// for a round nobody has judged, `VERDICT_TIMEOUT` after it closed. Zero when nothing is waiting.
+    function hungJuryAt() public view returns (uint256) {
+        if (cursor >= roundDays.length) return 0;
+        uint256 day = roundDays[cursor];
+        Round storage r = _rounds[day];
+        if (r.status == Status.Pending) return r.requestedAt + VERDICT_TIMEOUT;
+        return (day + 1) * 1 days + VERDICT_TIMEOUT;
+    }
+
     /// @notice Asks the IMD oracle panel which of the oldest closed round's entries is the most human.
-    /// Pulls 0.5 IMD from the caller (approve this contract first) and pays the caller 3% of the pot as a
-    /// pull claim. A previous request that timed out is declared a hung jury on the way.
+    /// Pulls `judgePrice()` IMD from the caller (approve this contract first) and pays the caller 3% of
+    /// the pot as a pull claim. A previous request that timed out is declared a hung jury on the way,
+    /// and a sunset that is due is settled first.
     function judge() external returns (bytes32 intakeRequestId) {
+        _settleDueSunset();
         if (cursor >= roundDays.length) revert NothingToJudge();
         uint256 day = roundDays[cursor];
         Round storage r = _rounds[day];
         if (r.status == Status.Pending) {
             if (block.timestamp < r.requestedAt + VERDICT_TIMEOUT) revert VerdictPending(day);
-            _hung(day);
+            _hung(day, true);
             if (cursor >= roundDays.length) revert NothingToJudge();
             day = roundDays[cursor];
             r = _rounds[day];
@@ -234,10 +266,11 @@ contract MeatbagGame is OracleAttestationConsumer {
         pot -= reward;
         _credit(msg.sender, reward);
 
-        IERC20(IMD).safeTransferFrom(msg.sender, address(this), PRICE);
-        IERC20(IMD).forceApprove(INTAKE, PRICE);
+        uint256 price = judgePrice();
+        IERC20(IMD).safeTransferFrom(msg.sender, address(this), price);
+        IERC20(IMD).forceApprove(INTAKE, price);
         intakeRequestId = IIntake(INTAKE)
-            .request(ACTION, judgeBody(day), IIntake.Callback(address(this), this.onOracleResult.selector), IMD, PRICE);
+            .request(ACTION, judgeBody(day), IIntake.Callback(address(this), this.onOracleResult.selector), IMD, price);
 
         r.status = Status.Pending;
         r.requestedAt = uint64(block.timestamp);
@@ -247,14 +280,28 @@ contract MeatbagGame is OracleAttestationConsumer {
         emit Judging(day, intakeRequestId, msg.sender, reward);
     }
 
-    /// @notice Declares the pending round a hung jury once its request has timed out without a verdict.
+    /// @notice Declares the round at the cursor a hung jury once `hungJuryAt()` has passed: a request that
+    /// got no verdict, or a closed round that nobody could judge (the intake refuses it, say). Either way
+    /// the pot carries over and the round counts toward the sunset rule.
     function declareHungJury() external {
+        _settleDueSunset();
         if (cursor >= roundDays.length) revert NothingToJudge();
         uint256 day = roundDays[cursor];
-        Round storage r = _rounds[day];
-        if (r.status != Status.Pending) revert NotPending(day);
-        if (block.timestamp < r.requestedAt + VERDICT_TIMEOUT) revert NotTimedOut(day);
-        _hung(day);
+        if (block.timestamp < hungJuryAt()) revert NotTimedOut(day);
+        _hung(day, true);
+    }
+
+    /// @notice Settles a sunset the oracle callback left due: the callback only marks the seventh round
+    /// hung (it runs under a 200,000 gas stipend), and anyone may split the pot from here. `judge()` and
+    /// `declareHungJury()` do the same on their way.
+    function sunset() external {
+        if (unsettledStreak < SUNSET_AFTER) revert NoSunsetDue();
+        _sunset();
+    }
+
+    /// @notice Whether seven rounds in a row are unsettled and the pot waits to be split.
+    function sunsetDue() external view returns (bool) {
+        return unsettledStreak >= SUNSET_AFTER;
     }
 
     /// @notice The callback for `oracle.request`: only the intake, only for the pending request, only with
@@ -279,12 +326,12 @@ contract MeatbagGame is OracleAttestationConsumer {
             a.panelSize < PANEL_SIZE || a.quorum < QUORUM || a.agreed < a.quorum
                 || a.answerType != OracleAttestation.ANSWER_UINT256
         ) {
-            _hung(day);
+            _hung(day, false);
             return;
         }
         uint256 index = abi.decode(a.answer, (uint256));
         if (index >= r.count) {
-            _hung(day);
+            _hung(day, false);
             return;
         }
 
@@ -388,7 +435,10 @@ contract MeatbagGame is OracleAttestationConsumer {
         }
     }
 
-    function _hung(uint256 day) internal {
+    /// @dev Marks the round hung. `settleSunset` is false inside the oracle callback, whose 200,000 gas
+    /// stipend cannot carry the sunset loop: the sunset is then left due for `sunset()`, `judge()` or
+    /// `declareHungJury()`, each of which settles it before touching another round.
+    function _hung(uint256 day, bool settleSunset) internal {
         Round storage r = _rounds[day];
         r.status = Status.Hung;
         delete pendingDay[r.intakeRequestId];
@@ -396,12 +446,16 @@ contract MeatbagGame is OracleAttestationConsumer {
         unsettledStreak++;
         emit HungJury(day, unsettledStreak);
         herald.announce(_H_FIRST_HUNG_JURY);
+        if (settleSunset && unsettledStreak >= SUNSET_AFTER) _sunset();
+    }
+
+    function _settleDueSunset() internal {
         if (unsettledStreak >= SUNSET_AFTER) _sunset();
     }
 
-    /// @dev Splits the pot equally among every entrant of the last `SUNSET_AFTER` rounds, as pull claims.
+    /// @dev Splits the pot equally among every entrant of the unsettled streak's rounds, as pull claims.
     function _sunset() internal {
-        uint256 first = cursor - SUNSET_AFTER;
+        uint256 first = cursor - unsettledStreak;
         uint256 entrants;
         for (uint256 i = first; i < cursor; i++) {
             entrants += _rounds[roundDays[i]].count;

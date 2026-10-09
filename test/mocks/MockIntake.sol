@@ -17,17 +17,37 @@ contract MockIntake is IIntake {
         uint256 amount;
     }
 
+    error ActionNotSold();
+    error WrongAmount(uint256 expected, uint256 got);
+
     uint256 public count;
     mapping(bytes32 => Stored) public requests;
     bytes32 public lastRequestId;
     bytes public lastBody;
+    /// @notice What `priceOf` answers for every action in every asset. Defaults to the live 0.5 IMD.
+    uint256 public price = 0.5 ether;
+    /// @notice When set, `request` reverts `ActionNotSold`: the action was retired or is no longer sold.
+    bool public refusing;
+
+    function setPrice(uint256 price_) external {
+        price = price_;
+    }
+
+    function setRefusing(bool refusing_) external {
+        refusing = refusing_;
+    }
+
+    function priceOf(bytes32, address) external view returns (uint256) {
+        return price;
+    }
 
     function request(bytes32 action, bytes calldata body, Callback calldata callback, address asset, uint256 amount)
         external
         payable
         returns (bytes32 requestId)
     {
-        require(asset != address(0), "ActionNotSold");
+        if (refusing || asset == address(0)) revert ActionNotSold();
+        if (amount != price) revert WrongAmount(price, amount);
         IERC20(asset).transferFrom(msg.sender, address(this), amount);
         requestId = keccak256(abi.encode("intake", ++count));
         requests[requestId] = Stored(action, body, callback.target, callback.selector, asset, amount);
