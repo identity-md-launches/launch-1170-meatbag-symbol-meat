@@ -1,0 +1,30 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "MeatbagHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$factory"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "MeatbagToken",
+    "name": "MEATBAG",
+    "symbol": "MEAT",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "MEATBAG ($MEAT): the first token run by the IMD swarm, and a reverse Turing test. MeatbagToken is the launch's standard fixed-supply ERC-20 (no constructor arguments, no owner, no mint, no fee on transfer). MeatbagHook(IPoolManager poolManager, address factory) takes exactly two constructor arguments: $poolManager and $factory. There is no $owner argument because the brief forbids any owner, admin, upgrade or pause, and no $token argument because the hook reads the launch token from the PoolKey (currency1) in beforeInitialize. The hook's constructor itself deploys the project's three other contracts with plain CREATE and wires them immutably: HeartbeatTreasury, MeatbagHerald and MeatbagGame. Permissions, as getHookPermissions returns them (address flags 0x20CC): beforeInitialize, beforeSwap, afterSwap, beforeSwapReturnDelta, afterSwapReturnDelta. beforeInitialize accepts only sender == factory, only once, and only a pool whose currency0 is native ETH (this launch's ETH pair); it accepts fee 12500 and tickSpacing 60 and records the token, pool id and launch time. Every callback checks msg.sender == poolManager; unused callbacks revert. Fee: on every swap of the MEAT/ETH pool the hook takes 2% in ETH from the ETH side, inside the swap, for buys and sells, exact-in and exact-out (beforeSwapReturnDelta when ETH is the specified currency, afterSwapReturnDelta otherwise). Buys only: for the first 30 minutes after the pool opens the rate decays linearly from 25% to 2%, and everything above the 2% base goes to the pot. Every 2% base fee is split 55% to the game's pot, 25% to 0xd01122bbffd00fc96252c8b29867a5359a3bca13 (the swarm's wallet) and 20% to the HeartbeatTreasury. All rates, splits and recipients are immutable. Settlement: the fee is taken as native ETH when the PoolManager's ETH balance covers it and minted as an ERC-6909 ETH claim otherwise (a pool seeded with tokens only), redeemed on the next swap or by anyone via redeemClaims(); a swarm wallet that rejects ETH is kept owed and retried, so swaps never halt. The pool's LP fee is the policy's 12500 (1.25%) on top of the hook fee. Game: daily UTC rounds, enter(text) printable ASCII up to 200 bytes, 40 entries per round, one per wallet, slot k costs k x 0.001 ETH into the pot; judge() pays 0.5 IMD (0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7) to the IMD Intake 0x1397434cd35e8a9c8ac312a61d3a285eb31dea56 (action oracle.request@oracle-1, uint256 answer, panel evidence, panelSize 7, quorum 4) and earns 3% of the pot; the callback verifies the EIP-712 attestation from signer 0x5598aa9146215bc13eb26f2c692ad1461fd32982 (domain, expiry, replay); winner gets 80% of the pot by pull claim, the rest carries over; no verdict is a hung jury; after 7 unsettled rounds in a row those entrants get equal pull claims. Herald: event Message(address indexed to, string text) with to = 0x200e710acaa6a93bbc77146026328c40f1d60fb1, constructor letter verbatim, then fixed automatic milestone messages; the only caller-supplied text is the heartbeat wallet's end-of-job letter. Heartbeat: fundNextRun() is public, sends min(balance, 0.01 ETH) to the swarm's wallet and closes the treasury for 12 h x amount / 0.01 ETH (a full run for 12 h, a smaller one proportionally, so at most 0.01 ETH per 12 h); it can touch nothing else. No contract here is allocated any MEAT at launch. The hook's init code is about 26.5 KB (plus constructor arguments) because it embeds the three child contracts, under the 48 KB initcode limit; its runtime is about 7.3 KB with no DELEGATECALL, CALLCODE or SELFDESTRUCT."
+}
