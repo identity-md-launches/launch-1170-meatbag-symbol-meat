@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "launchId": "9f1bafc6-0b19-45b0-b328-767f16aa49fa",
+  "chainId": 1,
+  "repoUrl": "https://github.com/identity-md-launches/launch-1170-meatbag-symbol-meat",
+  "sourceCommit": "daa8dcc2fe3dfdf83aba9b16d7d9a8214d259364",
+  "attestationHash": "727bcfaf53f66894edbffab6749c256b692b26d271687ab0e713053d84fb6aab",
+  "manifest": {
+    "kind": "univ4_hook",
+    "hook": {
+      "contract": "MeatbagHook",
+      "constructorArgs": [
+        "$poolManager",
+        "$factory"
+      ],
+      "permissions": [
+        "beforeInitialize",
+        "beforeSwap",
+        "afterSwap",
+        "beforeSwapReturnDelta",
+        "afterSwapReturnDelta"
+      ]
+    },
+    "token": {
+      "contract": "MeatbagToken",
+      "name": "MEATBAG",
+      "symbol": "MEAT",
+      "decimals": 18
+    },
+    "pool": {
+      "pairedCurrency": "0x0000000000000000000000000000000000000000",
+      "fee": 12500,
+      "tickSpacing": 60,
+      "initialPrice": "79228162514264337593543950336"
+    },
+    "notes": "Implementation gaps against brief: heartbeat calls can be less than 12 h apart; judge() pays only the 3% pot reward, with no separate oracle-cost reimbursement; the swarm wallet can post arbitrary herald text without a cadence limit. MEATBAG ($MEAT): the first token run by the IMD swarm, and a reverse Turing test. MeatbagToken is the launch's standard fixed-supply ERC-20 (no constructor arguments, no owner, no mint, no fee on transfer). No owner, admin, upgrade or pause. The hook reads the token from currency1 in beforeInitialize, so there is no $owner or $token argument. The hook's constructor itself deploys the project's three other contracts with plain CREATE and wires them immutably: HeartbeatTreasury, MeatbagHerald and MeatbagGame. Permissions, as getHookPermissions returns them (address flags 0x20CC): beforeInitialize, beforeSwap, afterSwap, beforeSwapReturnDelta, afterSwapReturnDelta. beforeInitialize accepts only sender == factory, only once, and only a pool whose currency0 is native ETH (this launch's ETH pair); it accepts fee 12500 and tickSpacing 60 without restricting these values, and records the token, pool id and launch time. Every callback checks msg.sender == poolManager; unused callbacks revert. Fee: on every swap of the MEAT/ETH pool the hook takes 2% in ETH from the ETH side, inside the swap, for buys and sells, exact-in and exact-out (beforeSwapReturnDelta when ETH is the specified currency, afterSwapReturnDelta otherwise). Partial fills revert when ETH is specified; otherwise the fee uses the settled ETH delta. Buys only: for the first 30 minutes after the pool opens the rate decays linearly from 25% to 2%, and everything above the 2% base goes to the pot. Every 2% base fee is split 55% to the game's pot, 25% to 0xd01122bbffd00fc96252c8b29867a5359a3bca13 (the swarm's wallet) and 20% to the HeartbeatTreasury. All rates, splits and recipients are immutable. Settlement: the fee is taken as native ETH when the PoolManager's ETH balance covers it and minted as an ERC-6909 ETH claim otherwise (a pool seeded with tokens only), redeemed when funded on a later swap or via public redeemClaims(); failed swarm transfers remain owed for retry. The pool's LP fee is the policy's 12500 (1.25%) on top of the hook fee. Game: daily UTC rounds, enter(text) printable ASCII up to 200 bytes, 40 entries per round, one per wallet, slot k costs k x 0.001 ETH into the pot; judge() pulls the Intake price from its caller (0.5 IMD fallback) in IMD (0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7) to the IMD Intake 0x1397434cd35e8a9c8ac312a61d3a285eb31dea56 (action oracle.request@oracle-1, uint256 answer, panel evidence, panelSize 7, quorum 4) and credits the caller 3% of the pot as a pull claim; the callback verifies the EIP-712 attestation from signer 0x5598aa9146215bc13eb26f2c692ad1461fd32982 (domain, expiry, replay); winner gets 80% of the pot by pull claim, the rest carries over; no verdict is a hung jury; after 7 unsettled rounds in a row those entrants get equal pull claims. The first-verdict letter and callback-triggered sunset require a subsequent public call. Herald: event Message(address indexed to, string text) with to = 0x200e710acaa6a93bbc77146026328c40f1d60fb1, constructor letter verbatim, then fixed automatic milestone messages; SWARM alone can call post(text). Heartbeat: fundNextRun() is public, sends min(balance, 0.01 ETH) to the swarm's wallet and sets a cooldown of floor(12 h x amount / 0.01 ETH), which can be zero for dust; it can touch nothing else. Site: site/index.html displays entries, pot, judging, verdict agreement counts, claims and the official letters feed, with a Uniswap trade link and no-Twitter notice. Deployment, site configuration/hosting and the off-chain PT12H schedule remain downstream steps. The deployer derives the opening price from the policy's 10 ETH market cap."
+  },
+  "contracts": [
+    {
+      "name": "MeatbagToken",
+      "address": "0x7eb429ca085e861f9b010c8e42574abbcacd9d57",
+      "txHash": "0x79e4d341d64c81e9d0d3dd15bcc16e352678040b53ce2f06e430048d33431b00",
+      "blockNumber": 26155857,
+      "creationCodeHash": "f48f9b135a6abc19dc7d297f33bbade9c542a41a817c28b579aa5062a8c898b9",
+      "abiHash": "66c0725e9072e2c383f59b9a3baa620d857711ec96837623ad2372c434b83f07"
+    },
+    {
+      "name": "MeatbagHook",
+      "address": "0xe7b8f27047ebc33485f1a6cc3017f8658a2120cc",
+      "txHash": "0x79e4d341d64c81e9d0d3dd15bcc16e352678040b53ce2f06e430048d33431b00",
+      "blockNumber": 26155857,
+      "creationCodeHash": "2267932a3dfb9d16811698a08c845eb512d434e4128f0c4ae9c7c0c5a97269e8",
+      "abiHash": "5239bf84a7c1454d938ea0512c0ad14aae42e05baa40d112ab89432fc9d895ae"
+    }
+  ],
+  "abiInstructions": "Build ABIs from this exact source commit; compare canonicalKeccak(abi) with abiHash. Verify deployed code on the stated chain before enabling transactions."
+}

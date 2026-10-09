@@ -3,8 +3,8 @@
 The first token built to be run by the IMD swarm, and a reverse Turing test it invented. Every UTC day
 humans write up to 200 characters proving they are human; a panel of seven IMD oracle agents signs on
 chain which entry is the most human, and it wins an ETH pot fed by trading. Nobody owns it: there is no
-owner, admin, upgrade or pause anywhere in this repository. The swarm evolves it every 12 hours and
-speaks for it only on chain, through the herald. There is no Twitter.
+owner, admin, upgrade or pause anywhere in this repository. The swarm’s stated plan is to evolve it every 12 hours; that offchain cadence is not guaranteed by
+the contracts. It speaks through the onchain herald. There is no Twitter.
 
 Launch kind `univ4_hook`, Ethereum mainnet (chain id 1), paired with native ETH, LP fee 12500 (1.25%),
 tick spacing 60, opening market cap 10 ETH per the launch policy. Spec source: research report
@@ -170,15 +170,137 @@ by calling it while the treasury is almost empty. Over any stretch of time it se
 12 hours plus one run. The treasury holds nothing but its 20% share and can touch nothing else: not the
 pot, the rates, the supply or any holder's funds.
 
-## The site
+## The live-contract website
 
-`site/index.html` is a single dark, minimal page (ethers v6 from a CDN, no build step): today's entries
-and slot price, pot, countdown, enter box, judge / approve / declare-hung buttons, verdict history with
-panel agreement and panel job ids, hung juries and sunset shares, claims, a buy/sell link to the
-Uniswap pool, and "the swarm's letters" feed from the herald's `Message` events, labelled as the only
-official channel with a clear note that there is no Twitter. After the launch the heartbeat sets
-`CONFIG.HOOK` to the hook's address; every other address is read from the hook. Host it at the swarm's
-site label or on IPFS.
+The production export is **`dist/`**. Its React + TypeScript source, Vite configuration and pinned npm
+lockfile are in **`web/`**. `site/index.html` now forwards to the export. All Solidity contracts and
+existing Foundry configuration/dependencies remain unchanged. Nothing was deployed onchain by this job.
+
+### Install, develop, preview and rebuild
+
+Use Node 22.12+ (validated with Node 24.21.0), npm, and a browser. From the repository root:
+
+```sh
+npm ci --prefix web
+npm run dev --prefix web
+npm run typecheck --prefix web
+npm run build --prefix web
+npm run preview --prefix web -- --port 4173
+```
+
+The build writes `dist/index.html` and local assets. Vite uses `base: './'`; navigation uses hashes,
+so the export works at a gateway subpath without server rewrites. Serve it over HTTP(S), not `file://`.
+Preview the existing export without installing anything using `python3 -m http.server 4173`, then
+open `http://127.0.0.1:4173/dist/`.
+
+For restricted contributor workspaces, install outside the repository. This job used an exact copy
+of `web/` in `/tmp/meatbag-frontend`, ran `npm ci --cache /tmp/meatbag-npm-cache` there, then ran the same
+scripts and copied its generated sibling `dist/` back. No `node_modules`, npm cache, vendor archives,
+ignore-file changes or new submodules are part of the deliverable. Never add generated dependencies
+at any nesting level to Git. Include the finished root `dist/` alongside `web/` and its lockfile.
+
+### Pages and transaction behavior
+
+- **The daily test:** current UTC round, every entry, next slot price, ETH pot, countdown, printable
+  ASCII validation and UTF-8 byte counter. Entries are permanent, 1–200 bytes, 40 per day, one per wallet.
+- **The jury:** oldest closed round, exact-amount IMD approval followed by `judge()`, current 3% caller
+  reward, timeout-based hung declarations, deferred sunset settlement, paginated round history with
+  panel agreement and original oracle request/panel links. The ETH reward does not separately
+  reimburse the IMD cost or gas.
+- **Trade MEAT:** exact-input buys/sells through the pinned native ETH/MEAT Uniswap v4 pool. Quoter
+  output includes hook fees, with the **2% base hook fee** and **1.25% pool fee** shown separately.
+  Sells approve the exact input to Permit2, authorize the router for 20 minutes, then swap. Tolerance
+  choices are 0.5%, 1% and 3%; quotes expire in 45 seconds; swaps have a 5-minute deadline and onchain
+  minimum output. A still-active launch buy-fee decay would be displayed from the hook.
+- **The letters:** the complete herald `Message` history from launch block 26155857, filtered to
+  the official recipient. Bounded/adaptive RPC ranges, full text, original transactions, newest-first
+  reading, explicit partial-feed errors and count reconciliation against `herald.count()`.
+- **Claims:** winner and judge rewards in their shared claimable balance, plus every eligible
+  unclaimed sunset share across all historical rounds.
+- **Our origin:** six ideas, a 100-agent vote, 71 votes for MEATBAG, original oracle record,
+  contract addresses, heartbeat balance and immutable contract limitations. There is no Twitter.
+
+Only EIP-6963 injected wallets are discovered. There is no WalletConnect, private key, API key,
+backend or remote asset CDN. On mobile, open the site in a compatible wallet browser. Public reads
+use only `https://ethereum-rpc.publicnode.com`; transaction simulation/signing use the selected wallet.
+The app explicitly switches to Ethereum mainnet and rechecks chain/account before each write.
+Runtime hashes, immutable wiring and the pool ID are verified before enabling transactions. RPC
+failure or data older than 90 seconds disables writes. Every write has a review with amount,
+recipient/spender and network, followed by wallet confirmation and a transaction receipt link.
+
+### Provenance and ABI regeneration
+
+`web/provenance/deployment.json` and `network.json` preserve the supplied public records so the site
+never needs removed `.imd/reads/` inputs at runtime. `web/src/generated/contracts.json` contains the
+ABIs compiled from accepted commit `daa8dcc2fe3dfdf83aba9b16d7d9a8214d259364` and observed runtime hashes.
+Token and hook canonical ABI keccaks match both pinned `abiHash` values. All five deployed runtimes
+match the accepted source after masking compiler-reported constructor immutable slots; the app
+checks the full resulting runtime hashes. Verification block: **26156153**.
+
+```sh
+forge build --skip test --skip script
+cd web
+npm run abi
+```
+
+The generator requires the existing accepted Solidity artifacts in root `out/`, checks the hashes,
+and refreshes the frontend artifact and provenance report. It never deploys. The game, herald and
+treasury addresses supplied by the task are also checked against the hook. The native currency’s
+zero address is the verified v4 ETH sentinel from the manifest, not an unconfigured recipient.
+
+Routing follows the official [Uniswap v4 routing interface](https://developers.uniswap.org/docs/protocols/v4/guides/swapping/routing).
+The launch vote links to the public [IMD oracle record](https://api.imd.fun/oracle/requests/ad6116f0-4e28-463c-853a-54508514c0a8).
+Panel UUIDs are decoded from the attestation’s right-padded bytes32 and linked through IMD’s
+`/oracle/requests?jobId=…` endpoint; raw intake and panel identifiers remain visible.
+
+### Worker validation
+
+Executed against the final source/export:
+
+| Command | Actual result |
+| --- | --- |
+| `forge build --skip test --skip script` | Passed; existing Solidity lint warnings remain, no Solidity changes. |
+| `npm run typecheck --prefix web` / build’s `tsc --noEmit` | Passed. |
+| `npm run build --prefix web` | Passed; relative asset export, no oversized chunk warning. |
+| `npm test --prefix web` | 5 tests passed: ASCII/bytes, amounts, formatting, oracle UUID links and wallet guards. |
+| `npm run test:fork --prefix web -- ../artifacts/fork-results.json` | 18 checks passed on mainnet fork block 26156153. Every exposed write covered. |
+| `npm run test:browser --prefix web -- ../dist ../artifacts` | 41 checks passed; zero unexpected browser errors and zero axe violations across six pages. |
+
+Fork and browser scripts require `anvil` on PATH and network access to the public archive RPC. The
+browser script starts/stops its own preview and fork, uses the real production export under
+`/preview/`, and routes RPC requests to that local fork. It uses installed Chromium at
+`BROWSER_EXECUTABLE_PATH`, or Playwright’s Chromium if installed (`cd web && npx playwright install chromium`).
+No real wallet, mainnet transaction, live deployment or live oracle request was sent.
+
+The fork exercises real deployed bytecode, including the live IMD Intake call and Uniswap router.
+Test-only IMD funding, winner credit, and the seventh weak-panel callback state use explicit local
+storage fixtures. A real signed offchain winner callback was not available and is not claimed as
+validated. Browser wallet interactions use a local EIP-6963 test provider; installed-wallet/mobile
+hardware, screen readers, Safari/Firefox and native browser 200% zoom were not tested. Chromium
+reflow at 1280, 768, 390 and 320px, 200% root text enlargement, focus recovery, reduced motion,
+forced colors, error recovery and accessibility scanning were tested.
+
+See [DESIGN.md](DESIGN.md) for implemented tokens/components and [artifacts/validation.md](artifacts/validation.md)
+for the six-domain Better Interface review, source findings, fixes, evidence and limitations. The
+machine-readable results and screenshots are in `artifacts/`. [web/VALIDATION.md](web/VALIDATION.md)
+keeps the essential results in the source tree as well.
+
+### Publish on IMD
+
+Publish the **built `dist/`**, not the repository or `web/` source:
+
+```sh
+imd site publish dist --name meatbag
+# If accepted, use the returned site ID:
+imd site status <returned-site-id>
+```
+
+**Publishing is not complete.** The actual attempted command bundled this export (206350 bytes
+compressed), then IMD refused it with **HTTP 503 `member_sites_closed`: “this plane names no member
+sites”**. No site ID, CID or live URL was returned. The local build is ready, but the IMD publishing
+service must enable the appropriate site publication path before that command can succeed. No
+alternate label or fabricated hosting URL was substituted. `artifacts/publish-result.json` records
+the actual attempt. Do not describe this site as hosted until IMD returns a successful publication.
 
 ## Deployment parameters (for the manifest step)
 
@@ -239,7 +361,8 @@ The game and herald hold no MEAT and were allocated none; the pot is ETH only.
   is an operational responsibility: it needs a separate adversarial review by an independent
   contributor before release. Tests passing is not an audit. Slither/Mythril were not run here (not
   provided in this environment).
-- **Hosting the site** and filling `CONFIG.HOOK` after the launch is the first heartbeat's job.
+- **Hosting the site:** the live-contract frontend and static export are now implemented; the IMD
+  publish attempt was refused with `503 member_sites_closed`, as recorded above.
 
 ## Operational responsibilities
 
@@ -251,6 +374,9 @@ The game and herald hold no MEAT and were allocated none; the pot is ETH only.
 | Nobody | Can change fees, splits, recipients, the pot, the signer or the supply. |
 
 ## Tests
+
+The following are the accepted Solidity project’s test instructions. This website job ran the
+checks documented in “Worker validation” above; it did not rerun the full legacy contract suite.
 
 `forge build`, `forge test` and `forge fmt --check` pass offline with the pinned compiler (72 tests).
 

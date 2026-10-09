@@ -1,0 +1,32 @@
+{
+  "sourceCommit": "daa8dcc2fe3dfdf83aba9b16d7d9a8214d259364",
+  "block": 26156153,
+  "chainId": 1,
+  "contracts": {
+    "MeatbagToken": {
+      "address": "0x7eb429ca085e861f9b010c8e42574abbcacd9d57",
+      "abiHash": "66c0725e9072e2c383f59b9a3baa620d857711ec96837623ad2372c434b83f07",
+      "runtimeHash": "0xea378290d9a5f5be30ad46ecf44dde934668c6cf317f3991b5b19232690e873d"
+    },
+    "MeatbagHook": {
+      "address": "0xe7b8f27047ebc33485f1a6cc3017f8658a2120cc",
+      "abiHash": "5239bf84a7c1454d938ea0512c0ad14aae42e05baa40d112ab89432fc9d895ae",
+      "runtimeHash": "0xc1a468c34722370c9ca42cf1a82d15d356310d672e1a32b491804df277aefe66"
+    },
+    "MeatbagGame": {
+      "address": "0x70c1b03ccc02905b2ad5683156592418424c787b",
+      "abiHash": "f232c8d0169ebcd2b282f00ccb8eeabdd0df42854c56cdff31898d8c8c50dfc8",
+      "runtimeHash": "0x8885395acf14a0578e5ae83908b0672f92468db4448dccfe0d3c77a50672391c"
+    },
+    "MeatbagHerald": {
+      "address": "0xe5da3ee7b1b925e66eeae138962464687c135575",
+      "abiHash": "a5d93eabec4e60151fd377b2606873d51e1374ca9abc153ea1c6eaaedb1a8a66",
+      "runtimeHash": "0x9f4932124fc6c0edb774789d62ff05d89b9e6d0932a75b87984affe6951f2a08"
+    },
+    "HeartbeatTreasury": {
+      "address": "0xe24f78c9c1a0bec4ec3966d4bd701d46ac1ac787",
+      "abiHash": "5b89baa3bc81ddc89596607bfca6261ea245dfe954464a4bd9baeb64cd3061f9",
+      "runtimeHash": "0x04fccf65ce63739eb7bbecf94100d8d273f8cdfedafb3e8e9815f11c6de4a280"
+    }
+  }
+}

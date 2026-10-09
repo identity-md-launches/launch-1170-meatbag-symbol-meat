@@ -1,0 +1,32 @@
+{
+  "name": "meatbag-site",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "tsx --test tests/*.test.ts",
+    "test:fork": "tsx scripts/fork-check.ts",
+    "abi": "tsx scripts/generate-abis.ts",
+    "test:browser": "tsx scripts/browser-check.ts"
+  },
+  "dependencies": {
+    "ethers": "6.15.0",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "@types/react": "19.1.10",
+    "@types/react-dom": "19.1.9",
+    "@vitejs/plugin-react": "5.0.2",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2",
+    "vite": "7.1.3",
+    "@playwright/test": "1.55.1",
+    "axe-core": "4.10.3"
+  }
+}
