@@ -562,4 +562,72 @@ contract MeatbagGameEdgeTest is Test {
         assertEq(uint8(game.round(game.roundDays(0)).status), uint8(MeatbagGame.Status.Open));
         assertEq(game.claimable(keeper), 0, "no reward for a failed judge");
     }
+
+    // ---------------------------------------------------------------- the first-verdict letter
+
+    function test_hungCallbacksNeverPostTheFirstVerdictLetter() public {
+        enterAs(alice, "a");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        OracleAttestation.Attestation memory a = attestation(id, 0);
+        a.agreed = 3; // below quorum: a hung jury, not a verdict
+        assertTrue(intake.deliver(id, a, sign(a)));
+        assertEq(uint8(game.round(game.roundDays(0)).status), uint8(MeatbagGame.Status.Hung));
+        assertTrue(herald.sent(5), "first hung jury letter");
+        game.announceFirstVerdict();
+        assertFalse(game.firstVerdictAnnounced(), "a hung round is not a verdict");
+        assertFalse(herald.sent(4));
+    }
+
+    function test_declareHungJuryPostsAPendingFirstVerdictLetterBeforeHangingTheNextRound() public {
+        enterAs(alice, "a");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        assertTrue(intake.deliver(id, attestation(id, 0), sign(attestation(id, 0))));
+        assertFalse(herald.sent(4));
+        enterAs(bob, "b");
+        uint256 dayB = game.today();
+        // Nobody judges round B; once it times out anyone hangs it, and the letter goes out on the way.
+        vm.warp((dayB + 1) * 1 days + game.VERDICT_TIMEOUT());
+        uint256 countBefore = herald.count();
+        game.declareHungJury();
+        assertTrue(game.firstVerdictAnnounced());
+        assertTrue(herald.sent(4));
+        assertTrue(herald.sent(5));
+        assertEq(herald.count(), countBefore + 2, "first verdict and first hung jury, once each");
+        assertEq(uint8(game.round(dayB).status), uint8(MeatbagGame.Status.Hung));
+    }
+
+    function test_aSecondVerdictDoesNotRepostTheLetter() public {
+        enterAs(alice, "a");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        assertTrue(intake.deliver(id, attestation(id, 0), sign(attestation(id, 0))));
+        game.announceFirstVerdict();
+        enterAs(bob, "b");
+        nextDay();
+        uint256 countBefore = herald.count();
+        id = judgeAs(keeper);
+        assertTrue(intake.deliver(id, attestation(id, 0), sign(attestation(id, 0))));
+        vm.prank(bob);
+        game.claim();
+        game.announceFirstVerdict();
+        // Only a pot record may have been posted by the second judge(); never a second first-verdict.
+        assertLe(herald.count(), countBefore + 1);
+        assertTrue(herald.sent(4));
+    }
+
+    function test_aRefusedClaimDoesNotPostTheLetter() public {
+        enterAs(alice, "a");
+        nextDay();
+        bytes32 id = judgeAs(keeper);
+        assertTrue(intake.deliver(id, attestation(id, 0), sign(attestation(id, 0))));
+        vm.prank(bob); // owed nothing
+        vm.expectRevert(MeatbagGame.NothingToClaim.selector);
+        game.claim();
+        assertFalse(game.firstVerdictAnnounced(), "a reverted claim leaves the letter for the next call");
+        vm.prank(alice);
+        game.claim();
+        assertTrue(game.firstVerdictAnnounced());
+    }
 }

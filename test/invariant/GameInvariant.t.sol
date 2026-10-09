@@ -125,6 +125,17 @@ contract GameHandler is Test {
             require(game.claimable(who) >= potBefore * 300 / 10_000, "keeper not rewarded 3%");
         }
         require(game.unsettledStreak() < game.SUNSET_AFTER(), "judge left a sunset due");
+        _letterIsOut();
+    }
+
+    /// @dev Every public transition posts the first-verdict letter on its way once a verdict landed.
+    function _letterIsOut() internal view {
+        if (verdicts > 0) require(game.firstVerdictAnnounced(), "a verdict landed but the letter is missing");
+    }
+
+    function announce() external {
+        game.announceFirstVerdict();
+        _letterIsOut();
     }
 
     /// @dev Splits a sunset the oracle callback left due; refused otherwise.
@@ -135,6 +146,7 @@ contract GameHandler is Test {
             sunsets++;
             require(game.unsettledStreak() == 0, "sunset did not reset the streak");
             require(game.pot() <= potBefore, "sunset grew the pot");
+            _letterIsOut();
             return;
         }
         try game.sunset() {
@@ -171,18 +183,19 @@ contract GameHandler is Test {
         (uint8 v, bytes32 rr, bytes32 ss) = vm.sign(SIGNER_KEY, game.attestationDigest(a));
         uint256 cursorBefore = game.cursor();
         uint256 streakBefore = game.unsettledStreak();
+        bool letterBefore = game.firstVerdictAnnounced();
         bytes memory sig = abi.encodePacked(rr, ss, v);
         bool ok = intake.deliver(r.intakeRequestId, a, sig);
         if (!ok) {
-            // A well-formed, well-signed answer for the pending request should always land under the
-            // writer's 200,000 gas stipend. It does not: the first verdict needs about 211,000 gas
-            // once the keeper has pulled their reward (see .imd-findings.json, "first verdict exceeds
-            // the stipend"). The failure is counted, not blessed, and the delivery is repeated with
-            // unbounded gas, which bubbles any revert that is not out-of-gas: the attestation itself
-            // must be good.
+            // A well-formed, well-signed answer for the pending request must land under the writer's
+            // 200,000 gas stipend; a miss is counted (and `invariant_validAnswersFitTheStipend` fails on
+            // it). The delivery is repeated with unbounded gas, which bubbles any revert that is not
+            // out-of-gas: the attestation itself must be good.
             stipendFailures++;
             intake.deliverTo(address(game), game.onOracleResult.selector, r.intakeRequestId, a, sig);
         }
+        // The callback never posts the first-verdict letter itself: it waits for an ordinary transaction.
+        require(game.firstVerdictAnnounced() == letterBefore, "the oracle callback posted the letter");
         require(game.cursor() == cursorBefore + 1, "a delivered answer must close the round");
         if (kind >= 7) {
             hungJuries++;
@@ -220,6 +233,7 @@ contract GameHandler is Test {
             require(streak == (sunsetWasDue ? 1 : streakBefore + 1), "streak grows by one");
         }
         require(game.round(day).status == MeatbagGame.Status.Hung, "round not hung");
+        _letterIsOut();
     }
 
     function claim(uint256 actorSeed) external {
@@ -232,6 +246,7 @@ contract GameHandler is Test {
         require(who.balance - before == owed, "claim pays exactly what was owed");
         withdrawn += owed;
         withdrawnBy[who] += owed;
+        _letterIsOut();
     }
 
     function claimSunset(uint256 actorSeed, uint256 roundSeed) external {
@@ -349,6 +364,23 @@ contract GameInvariantTest is Test {
             assertTrue(r.status == MeatbagGame.Status.Hung, "a streak round is not hung");
             assertEq(r.sunsetShare, 0, "a streak round was already split");
         }
+    }
+
+    /// @notice A valid, well-signed answer always lands under the oracle writer's 200,000 gas stipend.
+    function invariant_validAnswersFitTheStipend() public view {
+        assertEq(handler.stipendFailures(), 0, "a valid answer ran out of the 200,000 gas stipend");
+    }
+
+    /// @notice The first-verdict letter is posted at most once, only by the game, and only after a round
+    /// actually settled.
+    function invariant_firstVerdictLetterFollowsASettledRound() public view {
+        assertEq(herald.sent(4), game.firstVerdictAnnounced(), "herald and game disagree on the letter");
+        if (!game.firstVerdictAnnounced()) return;
+        bool settled;
+        for (uint256 i = 0; i < game.cursor(); i++) {
+            if (game.round(game.roundDays(i)).status == MeatbagGame.Status.Settled) settled = true;
+        }
+        assertTrue(settled, "letter posted without a verdict");
     }
 
     /// @notice The pot record never falls below the pot at any judging, and the pot never exceeds what
