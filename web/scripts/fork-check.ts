@@ -27,7 +27,12 @@ import {
   verifyDeployment,
   readLetters,
   readAccount,
+  readUnclaimed,
+  treasury,
+  treasuryTx,
+  simulateCall,
 } from "../src/chain";
+import { heartbeat, pendingEligibility } from "../src/pending";
 const block = JSON.parse(
   readFileSync(
     new URL("../provenance/verification.json", import.meta.url),
@@ -39,7 +44,7 @@ const anvil = spawn(
   "anvil",
   [
     "--fork-url",
-    RPC,
+    process.env.FORK_RPC_URL || RPC,
     "--fork-block-number",
     String(block),
     "--chain-id",
@@ -48,6 +53,10 @@ const anvil = spawn(
     String(port),
     "--silent",
     "--no-storage-caching",
+    "--fork-state-by-number",
+    "--no-fork-node-info",
+    "--compute-units-per-second",
+    "100",
   ],
   { stdio: ["ignore", "pipe", "pipe"] },
 );
@@ -96,6 +105,7 @@ try {
   const signer = await p.getSigner(0),
     actor = await signer.getAddress();
   const send = async (tx: TransactionRequest) => {
+    await simulateCall(tx, actor, p);
     const receipt = await (
       await signer.sendTransaction({ ...tx, gasLimit: 4000000n })
     ).wait();
@@ -122,6 +132,67 @@ try {
       assert.equal(l.length, s.lettersCount);
       assert(l.some((x) => x.text.includes("71 chose MEATBAG")));
     },
+  );
+  await attempt(
+    "Pending heartbeat: zero, dust, partial, capped balance and cooldown; exact eth_call and receipt",
+    async () => {
+      const saved = await p.send("evm_snapshot", []);
+      try {
+        const t = treasury(p);
+        for (const balance of [
+          0n,
+          1n,
+          parseEther("0.005"),
+          parseEther("0.02"),
+        ]) {
+          await p.send("anvil_setBalance", [A.treasury, toBeHex(balance)]);
+          await setStorage(A.treasury, word(1n), 0n);
+          const s = await readSnapshot(p);
+          const expected = heartbeat(balance, s.nextRunAt, s.timestamp);
+          assert.equal(pendingEligibility(s).heartbeat, balance > 0n);
+          if (!expected.eligible) {
+            await assert.rejects(
+              () => simulateCall(treasuryTx(), actor, p),
+              /NothingToSend/,
+            );
+            continue;
+          }
+          const swarmBefore = await p.getBalance(s.swarm);
+          const receipt = await send(treasuryTx());
+          const mined = await p.getBlock(receipt.blockNumber);
+          assert.equal(
+            await p.getBalance(s.swarm),
+            swarmBefore + expected.amount,
+          );
+          assert.equal(await t.lastRunAt(), BigInt(mined!.timestamp));
+          assert.equal(
+            await t.nextRunAt(),
+            BigInt(mined!.timestamp + expected.cooldown),
+          );
+          if (expected.cooldown) {
+            assert.equal(
+              pendingEligibility(await readSnapshot(p)).heartbeat,
+              false,
+            );
+            await assert.rejects(
+              () => simulateCall(treasuryTx(), actor, p),
+              /TooSoon/,
+            );
+          }
+        }
+        await p.send("evm_setNextBlockTimestamp", [
+          Number(await t.nextRunAt()),
+        ]);
+        await p.send("evm_mine", []);
+        assert.equal(pendingEligibility(await readSnapshot(p)).heartbeat, true);
+        await send(treasuryTx());
+      } finally {
+        await p.send("evm_revert", [saved]);
+      }
+    },
+  );
+  report.limitations.push(
+    "Heartbeat boundaries use local Anvil balances and cooldown storage only; all transfers execute the pinned deployed treasury bytecode.",
   );
   await attempt(
     "Buy MEAT: live v4 quote and frontend Universal Router calldata",
@@ -198,6 +269,32 @@ try {
       await reverted(gameTx("enter", ["Wrong payment."], 0n));
     },
   );
+  await attempt(
+    "Pending first-verdict letter: eligibility, eth_call, herald event and cleared action",
+    async () => {
+      const saved = await p.send("evm_snapshot", []);
+      try {
+        const d = Number(await g.today());
+        const key = slot("uint256", d, 12);
+        const packed = BigInt(await p.getStorage(A.game, key));
+        await setStorage(A.game, key, (packed & ~255n) | 3n);
+        await setStorage(A.game, word(9n), await g.roundCount());
+        await setStorage(A.game, word(11n), 0n);
+        const before = await readSnapshot(p);
+        assert.equal(pendingEligibility(before).letter, true);
+        await send(gameTx("announceFirstVerdict"));
+        const after = await readSnapshot(p);
+        assert.equal(after.firstVerdictAnnounced, true);
+        assert.equal(after.lettersCount, before.lettersCount + 1);
+        assert.equal(pendingEligibility(after).letter, false);
+      } finally {
+        await p.send("evm_revert", [saved]);
+      }
+    },
+  );
+  report.limitations.push(
+    "The first-verdict callback state is a local settled-round/cursor/announcement fixture; no oracle signature is fabricated and the original herald call executes on forked deployed code.",
+  );
   // IMD balance fixture only. Locate the real balance mapping by reversible storage probes.
   const imd = new Contract(A.imd, ERC20_ABI, p);
   let imdFunded = false;
@@ -229,6 +326,7 @@ try {
     async () => {
       const pot = await g.pot();
       const before = await g.claimable(actor);
+      assert.equal(pendingEligibility(await readSnapshot(p)).judge, true);
       await send(gameTx("judge"));
       assert.equal((await g.claimable(actor)) - before, (pot * 3n) / 100n);
       assert.equal(Number((await g.round(day)).status), 2);
@@ -241,8 +339,18 @@ try {
       assert(judged, "Judge did not succeed");
       const amount = await g.claimable(actor);
       assert(amount > 0n);
+      const prizes = await readUnclaimed(await p.getBlockNumber(), p);
+      assert.equal(
+        prizes.find((prize) => prize.address === actor.toLowerCase())?.amount,
+        amount,
+      );
       await send(gameTx("claim"));
       assert.equal(await g.claimable(actor), 0n);
+      assert(
+        !(await readUnclaimed(await p.getBlockNumber(), p)).some(
+          (prize) => prize.address === actor.toLowerCase(),
+        ),
+      );
       await reverted(gameTx("claim"));
     },
   );
@@ -252,6 +360,10 @@ try {
     async () => {
       const amount = parseEther("0.0001");
       const total = await g.totalClaimable();
+      await p.send("anvil_setBalance", [
+        A.game,
+        toBeHex((await p.getBalance(A.game)) + amount),
+      ]);
       await setStorage(A.game, slot("address", actor, 7), amount);
       await setStorage(A.game, word(6n), total + amount);
       await send(gameTx("claim"));
@@ -270,6 +382,7 @@ try {
       await p.send("evm_setNextBlockTimestamp", [at + 1]);
       await p.send("evm_mine", []);
       const pot = await g.pot();
+      assert.equal(pendingEligibility(await readSnapshot(p)).hung, true);
       await send(gameTx("declareHungJury"));
       assert.equal(Number((await g.round(day)).status), 4);
       assert.equal(await g.pot(), pot);
@@ -305,6 +418,7 @@ try {
     "sunset(): seven-round pot split creates equal shares",
     async () => {
       assert.equal(await g.sunsetDue(), true);
+      assert.equal(pendingEligibility(await readSnapshot(p)).sunset, true);
       const pot = await g.pot();
       await send(gameTx("sunset"));
       assert.equal(await g.sunsetDue(), false);
@@ -318,6 +432,11 @@ try {
       const before = await g.totalClaimable();
       const share = (await g.round(day)).sunsetShare;
       assert(share > 0n);
+      assert(
+        (await readAccount(actor, await readSnapshot(p), p)).sunsets.some(
+          (share) => share.day === day,
+        ),
+      );
       await send(gameTx("claimSunset", [day]));
       assert.equal(await g.sunsetClaimed(day, actor), true);
       assert.equal(await g.totalClaimable(), before - share);

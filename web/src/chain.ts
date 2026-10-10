@@ -23,6 +23,8 @@ import {
   ROUTER_ABI,
 } from "./config";
 import type { Entry, Round } from "./domain";
+import { errorText } from "./domain";
+import { sunsetShareDue } from "./pending";
 export const rpc = new JsonRpcProvider(RPC, 1, {
   staticNetwork: true,
   batchMaxCount: 20,
@@ -33,6 +35,8 @@ export const game = (p: Provider = rpc) =>
   new Contract(A.game, C.MeatbagGame.abi, p);
 export const hook = (p: Provider = rpc) =>
   new Contract(A.hook, C.MeatbagHook.abi, p);
+export const treasury = (p: Provider = rpc) =>
+  new Contract(A.treasury, C.HeartbeatTreasury.abi, p);
 export async function verifyDeployment(p: Provider = rpc) {
   if (BigInt(await (p as JsonRpcProvider).send("eth_chainId", [])) !== 1n)
     throw Error("RPC is not Ethereum mainnet. Transactions are disabled.");
@@ -94,6 +98,12 @@ export type Snapshot = {
   volume: bigint;
   lettersCount: number;
   treasuryBalance: bigint;
+  lastRunAt: number;
+  nextRunAt: number;
+  swarm: string;
+  firstVerdictAnnounced: boolean;
+  cursor: number;
+  previousRoundStatus: number | null;
 };
 function toEntries(values: any[]): Entry[] {
   return values.map((e) => ({ author: e.author, text: e.text }));
@@ -143,6 +153,11 @@ export async function readSnapshot(p: Provider = rpc): Promise<Snapshot> {
     volume,
     lettersCount,
     treasuryBalance,
+    lastRunAt,
+    nextRunAt,
+    swarm,
+    firstVerdictAnnounced,
+    cursor,
   ] = await Promise.all([
     g.pot(o),
     g.nextSlotPrice(o),
@@ -157,6 +172,11 @@ export async function readSnapshot(p: Provider = rpc): Promise<Snapshot> {
     h.volume(o),
     new Contract(A.herald, C.MeatbagHerald.abi, p).count(o),
     p.getBalance(A.treasury, b.number),
+    treasury(p).lastRunAt(o),
+    treasury(p).nextRunAt(o),
+    treasury(p).SWARM(o),
+    g.firstVerdictAnnounced(o),
+    g.cursor(o),
   ]);
   return {
     block: b.number,
@@ -178,6 +198,15 @@ export async function readSnapshot(p: Provider = rpc): Promise<Snapshot> {
     volume,
     lettersCount: Number(lettersCount),
     treasuryBalance,
+    lastRunAt: Number(lastRunAt),
+    nextRunAt: Number(nextRunAt),
+    swarm,
+    firstVerdictAnnounced,
+    cursor: Number(cursor),
+    previousRoundStatus:
+      cursor > 0n
+        ? Number((await g.round(await g.roundDays(cursor - 1n, o), o)).status)
+        : null,
   };
 }
 export async function readHistory(
@@ -239,6 +268,7 @@ export async function readLetters(
   return result.sort((a, b) => b.block - a.block || b.index - a.index);
 }
 export type AccountState = {
+  block: number;
   address: string;
   eth: bigint;
   meat: bigint;
@@ -278,12 +308,14 @@ export async function readAccount(
             g.hasEntered(day, address, o),
             g.sunsetClaimed(day, address, o),
           ]);
-          if (entered && !claimed) sunsets.push({ day, amount: r.sunsetShare });
+          if (sunsetShareDue(r.sunsetShare, entered, claimed))
+            sunsets.push({ day, amount: r.sunsetShare });
         }
       }),
     );
   }
   return {
+    block: s.block,
     address,
     eth,
     meat,
@@ -303,6 +335,143 @@ export const gameTx = (
   data: new Interface(C.MeatbagGame.abi).encodeFunctionData(name, args),
   value,
 });
+export const treasuryTx = (): TransactionRequest => ({
+  to: A.treasury,
+  data: new Interface(C.HeartbeatTreasury.abi).encodeFunctionData(
+    "fundNextRun",
+  ),
+  value: 0n,
+});
+
+export type UnclaimedPrize = { address: string; amount: bigint };
+const gameInterface = new Interface(C.MeatbagGame.abi);
+const prizeCache = new WeakMap<
+  Provider,
+  { block: number; hash: string; addresses: string[] }
+>();
+
+/** Scan both credit-producing events from launch; no recent-history cutoff. */
+export async function readUnclaimed(
+  toBlock: number,
+  p: Provider = rpc,
+): Promise<UnclaimedPrize[]> {
+  let cached = prizeCache.get(p);
+  if (
+    cached &&
+    (cached.block > toBlock ||
+      (await p.getBlock(cached.block))?.hash !== cached.hash)
+  )
+    cached = undefined;
+  const candidates = new Set(cached?.addresses ?? []);
+  const topics = [
+    [
+      gameInterface.getEvent("Verdict")!.topicHash,
+      gameInterface.getEvent("Judging")!.topicHash,
+    ],
+  ];
+  async function range(fromBlock: number, end: number): Promise<void> {
+    let logs;
+    try {
+      logs = await p.getLogs({
+        address: A.game,
+        topics,
+        fromBlock,
+        toBlock: end,
+      });
+    } catch (e) {
+      if (end - fromBlock < 100) throw e;
+      const mid = Math.floor((fromBlock + end) / 2);
+      await range(fromBlock, mid);
+      await range(mid + 1, end);
+      return;
+    }
+    for (const log of logs) {
+      if (log.removed) continue;
+      const event = gameInterface.parseLog(log);
+      if (event)
+        candidates.add(
+          String(
+            event.name === "Verdict" ? event.args.winner : event.args.keeper,
+          ).toLowerCase(),
+        );
+    }
+  }
+  for (
+    let start = cached ? cached.block + 1 : START_BLOCK;
+    start <= toBlock;
+    start += 10000
+  )
+    await range(start, Math.min(start + 9999, toBlock));
+  const block = await p.getBlock(toBlock);
+  if (!block?.hash)
+    throw Error("Prize scan block unavailable. Refresh to retry.");
+  prizeCache.set(p, {
+    block: toBlock,
+    hash: block.hash,
+    addresses: [...candidates],
+  });
+  const result: UnclaimedPrize[] = [],
+    addresses = [...candidates],
+    g = game(p);
+  for (let i = 0; i < addresses.length; i += 10) {
+    const batch = await Promise.all(
+      addresses.slice(i, i + 10).map(async (address) => ({
+        address,
+        amount: BigInt(await g.claimable(address, { blockTag: toBlock })),
+      })),
+    );
+    result.push(...batch.filter((prize) => prize.amount > 0n));
+  }
+  return result.sort((a, b) => a.address.localeCompare(b.address));
+}
+
+/** eth_call often supplies raw custom-error data rather than a readable reason. */
+export function simulationError(e: unknown): string {
+  const err = e as {
+    data?: unknown;
+    error?: { data?: unknown };
+    info?: { error?: { data?: unknown } };
+  };
+  const values = [err?.data, err?.error?.data, err?.info?.error?.data];
+  for (const value of values) {
+    const data =
+      typeof value === "string"
+        ? value
+        : ((value as { data?: string; result?: string })?.data ??
+          (value as { result?: string })?.result);
+    if (!data || !/^0x[0-9a-f]+$/i.test(data)) continue;
+    for (const abi of [
+      C.MeatbagGame.abi,
+      C.HeartbeatTreasury.abi,
+      C.MeatbagHerald.abi,
+    ]) {
+      try {
+        const decoded = new Interface(abi).parseError(data);
+        if (decoded)
+          return `${decoded.name}(${decoded.args.map(String).join(", ")})`;
+      } catch {
+        /* Try the next deployed ABI. */
+      }
+    }
+  }
+  return errorText(e);
+}
+export async function simulateCall(
+  request: TransactionRequest,
+  from: string,
+  p: Provider = rpc,
+  blockTag?: number,
+): Promise<void> {
+  try {
+    await p.call({
+      ...request,
+      from,
+      ...(blockTag === undefined ? {} : { blockTag }),
+    });
+  } catch (e) {
+    throw Error(simulationError(e));
+  }
+}
 export const approveTx = (
   asset: string,
   spender: string,

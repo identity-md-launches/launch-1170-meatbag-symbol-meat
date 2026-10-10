@@ -13,8 +13,8 @@ import {
   zeroPadValue,
   toBeHex,
 } from "ethers";
-import { A, RPC, ERC20_ABI } from "../src/config";
-import { game } from "../src/chain";
+import { A, C, RPC, ERC20_ABI } from "../src/config";
+import { game, gameTx } from "../src/chain";
 const exportDir = resolve(process.argv[2] || "../dist"),
   outDir = resolve(process.argv[3] || "../artifacts");
 mkdirSync(outDir, { recursive: true });
@@ -29,7 +29,7 @@ const anvil = spawn(
   "anvil",
   [
     "--fork-url",
-    RPC,
+    process.env.FORK_RPC_URL || RPC,
     "--fork-block-number",
     String(block),
     "--chain-id",
@@ -38,6 +38,10 @@ const anvil = spawn(
     "18548",
     "--silent",
     "--no-storage-caching",
+    "--fork-state-by-number",
+    "--no-fork-node-info",
+    "--compute-units-per-second",
+    "100",
   ],
   { stdio: ["ignore", "pipe", "pipe"] },
 );
@@ -90,6 +94,7 @@ const context = await browser.newContext({
 });
 const page = await context.newPage();
 const issues: string[] = [];
+const rpcErrors: unknown[] = [];
 const checks: string[] = [];
 const axeResults: any[] = [];
 page.on("pageerror", (e) => issues.push(e.message));
@@ -108,7 +113,7 @@ async function mainnetReady() {
   });
   await expect(
     page.getByRole("button", { name: "Refresh", exact: true }),
-  ).toBeEnabled();
+  ).toBeEnabled({ timeout: 30000 });
 }
 async function navigate(hash: string) {
   await page.locator(`nav a[href='#${hash}']`).click();
@@ -127,6 +132,13 @@ try {
     }
   }
   const actor = await (await p.getSigner(0)).getAddress();
+  const word = (v: bigint) => zeroPadValue(toBeHex(v), 32);
+  const mappingSlot = (type: string, key: number | string, base: number) =>
+    keccak256(
+      AbiCoder.defaultAbiCoder().encode([type, "uint256"], [key, base]),
+    );
+  const setStorage = (address: string, key: string, value: bigint) =>
+    p.send("anvil_setStorageAt", [address, key, word(value)]);
   await page.route(RPC + "/**", async (route) => {
     if (offline) {
       await route.fulfill({ status: 503, body: "RPC temporarily unavailable" });
@@ -137,11 +149,12 @@ try {
       headers: { "content-type": "application/json" },
       body: route.request().postData(),
     });
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: await response.text(),
-    });
+    const body = await response.text();
+    const decoded = JSON.parse(body);
+    for (const item of Array.isArray(decoded) ? decoded : [decoded]) {
+      if (item.error) rpcErrors.push(item.error);
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body });
   });
   await page.exposeFunction(
     "forkRequest",
@@ -170,6 +183,17 @@ try {
     addEventListener('eip6963:requestProvider',announce);
   `,
   });
+  async function restoreFixture(saved: string) {
+    await page.goto("about:blank");
+    await p.send("evm_revert", [saved]);
+    await page.goto(url + "#pending");
+    await mainnetReady();
+    await page
+      .getByRole("button", { name: "Connect wallet", exact: true })
+      .click();
+    await page.getByRole("button", { name: "Local fork wallet" }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  }
   await page.goto(url);
   await mainnetReady();
   await check(
@@ -183,6 +207,24 @@ try {
       expect(await page.locator("h1").count()).toBe(1);
     },
   );
+  await check("Pending navigation, badge and disconnected state", async () => {
+    await navigate("pending");
+    await expect(page.locator(".pending-badge")).not.toHaveText("…", {
+      timeout: 15000,
+    });
+    await expect(
+      page.getByRole("heading", { name: "PENDING ACTIONS." }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Connect wallet to act" }),
+    ).toBeVisible();
+    await expect(
+      page.getByText(
+        "Connect your wallet to check every round for your sunset shares.",
+      ),
+    ).toBeVisible();
+    await navigate("today");
+  });
   await check(
     "Entry required, ASCII, 200-byte boundary and focus errors",
     async () => {
@@ -257,6 +299,113 @@ try {
       await expect(page.locator(".entry-text")).toHaveText(
         "I sometimes forget why I opened a browser tab.",
       );
+    },
+  );
+  await check(
+    "Pending heartbeat: eth_call failure, recovery, exact review and transfer",
+    async () => {
+      const saved = await p.send("evm_snapshot", []);
+      try {
+        const treasury = new Contract(A.treasury, C.HeartbeatTreasury.abi, p);
+        const swarm = await treasury.SWARM();
+        await p.send("anvil_setBalance", [
+          A.treasury,
+          toBeHex(parseEther("0.005")),
+        ]);
+        await setStorage(A.treasury, word(1n), 0n);
+        const previousCode = await p.getCode(swarm);
+        await p.send("anvil_setCode", [swarm, "0x60006000fd"]); // local receiver rejection fixture
+        await p.send("evm_mine", []);
+        await refresh();
+        await navigate("pending");
+        await expect(page.getByText(/Call would fail: SendFailed/)).toBeVisible(
+          { timeout: 15000 },
+        );
+        await expect(
+          page.getByRole("button", { name: "Fund next run" }),
+        ).toBeDisabled();
+        await p.send("anvil_setCode", [swarm, previousCode]);
+        await p.send("evm_mine", []);
+        await refresh();
+        const fund = page.getByRole("button", { name: "Fund next run" });
+        await expect(fund).toBeEnabled({ timeout: 15000 });
+        await expect(page.locator(".pending-facts")).toContainText(
+          "21600 seconds",
+        );
+        await expect(page.locator(".pending-recipient")).toHaveText(
+          new RegExp(swarm),
+        );
+        await fund.focus();
+        await page.keyboard.press("Enter");
+        await expect(page.getByRole("dialog")).toContainText(
+          "treasury.fundNextRun()",
+        );
+        await expect(page.getByRole("dialog")).toContainText("0.005 ETH");
+        await expect(page.getByRole("dialog")).toContainText(swarm);
+        await page.keyboard.press("Escape");
+        await expect(fund).toBeFocused();
+        await page.screenshot({
+          path: resolve(outDir, "screenshots/pending-focus-fork.png"),
+          fullPage: true,
+        });
+        const before = await p.getBalance(swarm);
+        await fund.click();
+        await page.getByRole("button", { name: "Confirm in wallet" }).click();
+        await expect(page.getByRole("dialog")).toHaveCount(0, {
+          timeout: 30000,
+        });
+        expect(await p.getBalance(swarm)).toBe(before + parseEther("0.005"));
+        await expect(fund).toBeDisabled();
+        await expect(
+          page.getByText("The treasury has no ETH to send."),
+        ).toBeVisible();
+      } finally {
+        await restoreFixture(saved);
+      }
+    },
+  );
+  await check(
+    "Pending first-verdict letter: exact review, onchain event and cleared badge",
+    async () => {
+      const saved = await p.send("evm_snapshot", []);
+      try {
+        const g = game(p),
+          day = Number(await g.today());
+        const key = mappingSlot("uint256", day, 12);
+        const packed = BigInt(await p.getStorage(A.game, key));
+        await setStorage(A.game, key, (packed & ~255n) | 3n);
+        await setStorage(A.game, word(9n), await g.roundCount());
+        await setStorage(A.game, word(11n), 0n);
+        await p.send("evm_mine", []);
+        await refresh();
+        await navigate("pending");
+        await expect(
+          page.getByText("The first-verdict letter has not been posted"),
+        ).toBeVisible();
+        await expect(page.locator(".pending-badge")).not.toHaveText("…", {
+          timeout: 15000,
+        });
+        const before = Number(await page.locator(".pending-badge").innerText());
+        await page
+          .getByRole("button", { name: "Post first-verdict letter" })
+          .click();
+        await expect(page.getByRole("dialog")).toContainText(
+          "game.announceFirstVerdict()",
+        );
+        await page.getByRole("button", { name: "Confirm in wallet" }).click();
+        await expect(page.getByRole("dialog")).toHaveCount(0, {
+          timeout: 30000,
+        });
+        await expect(
+          page.getByText("The first-verdict letter has been posted."),
+        ).toBeVisible();
+        await expect(page.locator(".pending-badge")).toHaveText(
+          String(before - 1),
+          { timeout: 15000 },
+        );
+      } finally {
+        await restoreFixture(saved);
+      }
     },
   );
   await check(
@@ -355,7 +504,8 @@ try {
       ]);
       await p.send("evm_mine", []);
       await refresh();
-      await navigate("court");
+      await navigate("pending");
+      await page.getByRole("link", { name: "Open the Court" }).click();
       for (const label of ["Approve IMD", "Judge round"]) {
         await expect(
           page.getByRole("button", { name: label, exact: false }),
@@ -369,11 +519,17 @@ try {
       await expect(
         page.getByText("Panel deliberating", { exact: true }),
       ).toBeVisible();
-      await navigate("claims");
+      await navigate("today");
+      await expect(page.locator(".claim-banner")).toContainText("ETH to claim");
+      await page.getByRole("link", { name: "Review pending claims" }).click();
       await expect(
-        page.getByRole("button", { name: "Claim ETH" }),
-      ).toBeEnabled();
-      await page.getByRole("button", { name: "Claim ETH" }).click();
+        page.getByRole("button", { name: "Claim", exact: true }),
+      ).toBeEnabled({ timeout: 15000 });
+      await expect(page.locator(".pending-prizes").first()).toContainText(
+        "unclaimed",
+      );
+      await page.getByRole("button", { name: "Claim", exact: true }).click();
+      await expect(page.getByRole("dialog")).toContainText("game.claim()");
       await page.getByRole("button", { name: "Confirm in wallet" }).click();
       await expect(page.getByRole("dialog")).toHaveCount(0, { timeout: 30000 });
     },
@@ -386,13 +542,14 @@ try {
       ]);
       await p.send("evm_mine", []);
       await refresh();
-      await navigate("court");
+      await navigate("pending");
       await expect(
         page.getByRole("button", { name: "Declare hung jury" }),
       ).toBeEnabled();
       await page.getByRole("button", { name: "Declare hung jury" }).click();
       await page.getByRole("button", { name: "Confirm in wallet" }).click();
       await expect(page.getByRole("dialog")).toHaveCount(0, { timeout: 30000 });
+      await navigate("court");
       await page.locator("select").selectOption("hung");
       await expect(page.locator(".round-card")).toHaveCount(1);
     },
@@ -406,6 +563,10 @@ try {
         AbiCoder.defaultAbiCoder().encode(["address", "uint256"], [actor, 7]),
       );
       const total = await game(p).totalClaimable();
+      await p.send("anvil_setBalance", [
+        A.game,
+        toBeHex((await p.getBalance(A.game)) + parseEther("0.0001")),
+      ]);
       await p.send("anvil_setStorageAt", [
         A.game,
         key,
@@ -418,6 +579,38 @@ try {
       ]);
       await p.send("evm_mine", []);
       await refresh();
+      const connectAs = async (address: string) => {
+        await page.evaluate((address) => {
+          (window as any).testWalletState.actor = address;
+          (window as any).testWalletEmit("accountsChanged", [address]);
+        }, address);
+        await page
+          .getByRole("button", { name: "Connect wallet", exact: true })
+          .click();
+        await page.getByRole("button", { name: "Local fork wallet" }).click();
+        await expect(page.getByRole("dialog")).toHaveCount(0);
+      };
+      await connectAs(await (await p.getSigner(1)).getAddress());
+      await navigate("pending");
+      await expect(page.locator(".pending-prizes").first()).toContainText(
+        "0.0001 ETH",
+      );
+      await expect(
+        page.locator(
+          `.pending-prizes a[href='https://etherscan.io/address/${actor.toLowerCase()}']`,
+        ),
+      ).toBeVisible();
+      await expect(
+        page.getByRole("button", { name: "Claim", exact: true }),
+      ).toHaveCount(0);
+      await expect(page.locator(".pending-badge")).not.toHaveText("…", {
+        timeout: 15000,
+      });
+      await page.screenshot({
+        path: resolve(outDir, "screenshots/pending-other-claim-fork.png"),
+        fullPage: true,
+      });
+      await connectAs(actor);
       await navigate("claims");
       await expect(
         page.getByRole("button", { name: "Claim ETH" }),
@@ -431,6 +624,110 @@ try {
       ).toBeDisabled();
     },
   );
+  await check(
+    "Pending sunset settlement, exhaustive shares, claim banner and empty state",
+    async () => {
+      const saved = await p.send("evm_snapshot", []);
+      try {
+        const g = game(p),
+          signer = await p.getSigner(0);
+        const send = async (request: any) => {
+          const receipt = await (
+            await signer.sendTransaction({ ...request, gasLimit: 4000000n })
+          ).wait();
+          expect(receipt?.status).toBe(1);
+        };
+        for (let i = 0; i < 6; i++) {
+          await send(
+            gameTx(
+              "enter",
+              [`Browser sunset entry ${i}.`],
+              await g.nextSlotPrice(),
+            ),
+          );
+          await p.send("evm_setNextBlockTimestamp", [
+            Number(await g.hungJuryAt()) + 1,
+          ]);
+          await p.send("evm_mine", []);
+          if (i < 5) await send(gameTx("declareHungJury"));
+        }
+        const lastDay = Number(await g.nextRoundToJudge());
+        const key = mappingSlot("uint256", lastDay, 12);
+        await setStorage(
+          A.game,
+          key,
+          (BigInt(await p.getStorage(A.game, key)) & ~255n) | 4n,
+        );
+        await setStorage(A.game, word(9n), (await g.cursor()) + 1n);
+        await setStorage(A.game, word(10n), 7n);
+        await p.send("evm_mine", []);
+        await refresh();
+        await navigate("pending");
+        await page
+          .getByRole("button", { name: "Settle sunset", exact: true })
+          .click();
+        await expect(page.getByRole("dialog")).toContainText("game.sunset()");
+        await page.getByRole("button", { name: "Confirm in wallet" }).click();
+        await expect(page.getByRole("dialog")).toHaveCount(0, {
+          timeout: 30000,
+        });
+        await expect(
+          page.getByRole("button", { name: "Claim sunset share", exact: true }),
+        ).toHaveCount(7, { timeout: 20000 });
+        await navigate("today");
+        await expect(page.locator(".claim-banner")).toContainText(
+          "ETH to claim",
+        );
+        await page.getByRole("link", { name: "Review pending claims" }).click();
+        await expect(page.locator(".pending-badge")).not.toHaveText("…", {
+          timeout: 15000,
+        });
+        const count = Number(await page.locator(".pending-badge").innerText());
+        await page.setViewportSize({ width: 390, height: 844 });
+        await page.screenshot({
+          path: resolve(outDir, "screenshots/pending-shares-mobile-fork.png"),
+          fullPage: true,
+        });
+        await page
+          .getByRole("button", { name: "Claim sunset share", exact: true })
+          .first()
+          .click();
+        await expect(page.getByRole("dialog")).toContainText(
+          "game.claimSunset(",
+        );
+        await expect(page.getByRole("dialog")).toContainText(actor);
+        await page.getByRole("button", { name: "Confirm in wallet" }).click();
+        await expect(page.getByRole("dialog")).toHaveCount(0, {
+          timeout: 30000,
+        });
+        await expect(
+          page.getByRole("button", { name: "Claim sunset share", exact: true }),
+        ).toHaveCount(6, { timeout: 20000 });
+        await expect(page.locator(".pending-badge")).toHaveText(
+          String(count - 1),
+          { timeout: 15000 },
+        );
+        for (let i = 0; i < Number(await g.roundCount()); i++) {
+          const day = Number(await g.roundDays(i));
+          if (!(await g.sunsetClaimed(day, actor)))
+            await send(gameTx("claimSunset", [day]));
+        }
+        await p.send("anvil_setBalance", [A.treasury, "0x0"]);
+        await p.send("evm_mine", []);
+        await refresh();
+        await expect(
+          page.getByText(
+            "Nothing is waiting. Every public action is up to date.",
+          ),
+        ).toBeVisible({ timeout: 15000 });
+        await expect(page.locator(".pending-badge")).toHaveText("0");
+        await navigate("today");
+        await expect(page.locator(".claim-banner")).toHaveCount(0);
+      } finally {
+        await restoreFixture(saved);
+      }
+    },
+  );
   for (const width of [1280, 768, 390, 320]) {
     await page.setViewportSize({ width, height: 900 });
     for (const hash of [
@@ -440,6 +737,7 @@ try {
       "letters",
       "claims",
       "story",
+      "pending",
     ]) {
       await navigate(hash);
       await check(`${hash}: no horizontal overflow at ${width}px`, async () => {
@@ -465,6 +763,68 @@ try {
     await page.evaluate(() => (document.documentElement.style.fontSize = ""));
   });
   await check(
+    "Pending reflow at 200% text and 44px action/link targets",
+    async () => {
+      await navigate("pending");
+      await page.evaluate(
+        () => (document.documentElement.style.fontSize = "32px"),
+      );
+      expect(
+        await page.evaluate(
+          () => document.documentElement.scrollWidth <= innerWidth,
+        ),
+      ).toBe(true);
+      await page.evaluate(() => (document.documentElement.style.fontSize = ""));
+      const sizes = await page
+        .locator(".pending-panel button, .pending-panel a, nav a, .text-button")
+        .evaluateAll((elements) =>
+          elements.map((el) => ({
+            text: el.textContent,
+            width: el.getBoundingClientRect().width,
+            height: el.getBoundingClientRect().height,
+          })),
+        );
+      expect(sizes.filter((s) => s.height < 44 || s.width < 44)).toEqual([]);
+    },
+  );
+  const contrast = await page.evaluate(() => {
+    const luminance = (rgb: string) => {
+      const values = (rgb.match(/[\d.]+/g) || [])
+        .slice(0, 3)
+        .map((x) => Number(x) / 255)
+        .map((x) => (x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4));
+      return values[0] * 0.2126 + values[1] * 0.7152 + values[2] * 0.0722;
+    };
+    return [
+      ".pending-badge",
+      ".pending-panel > p",
+      ".pending-facts dd",
+      ".pending-link",
+    ].map((selector) => {
+      const el = document.querySelector(selector)!;
+      let parent: Element | null = el;
+      let background = "rgba(0, 0, 0, 0)";
+      while (parent && background === "rgba(0, 0, 0, 0)") {
+        background = getComputedStyle(parent).backgroundColor;
+        parent = parent.parentElement;
+      }
+      const foreground = getComputedStyle(el).color;
+      const a = luminance(foreground),
+        b = luminance(background);
+      return {
+        selector,
+        foreground,
+        background,
+        ratio: (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05),
+      };
+    });
+  });
+  expect(contrast.every((pair) => pair.ratio >= 4.5)).toBe(true);
+  writeFileSync(
+    resolve(outDir, "pending-contrast.json"),
+    JSON.stringify(contrast, null, 2) + "\n",
+  );
+  await check(
     "Reduced motion removes transitions and forced colors keeps controls visible",
     async () => {
       expect(
@@ -485,6 +845,7 @@ try {
     "letters",
     "claims",
     "story",
+    "pending",
   ]) {
     await navigate(hash);
     await page.addScriptTag({
@@ -562,6 +923,8 @@ try {
     ["mobile", 390, "today"],
     ["letters", 1280, "letters"],
     ["trade", 390, "trade"],
+    ["pending-desktop", 1280, "pending"],
+    ["pending-mobile", 390, "pending"],
   ] as const) {
     await page.setViewportSize({ width, height: 900 });
     await navigate(hash);
@@ -579,7 +942,8 @@ try {
       "Chromium emulation, not physical mobile or a screen reader.",
       "200% root text enlargement is not native browser zoom.",
       "Wallet is an EIP-6963 local-fork test provider, not an installed extension.",
-      "Winner claim uses a local credit fixture.",
+      "Winner claim uses a local credit fixture; letter and sunset callbacks use local storage fixtures.",
+      "The heartbeat failure uses local swarm receiver revert bytecode, restored after the check.",
     ],
   };
   writeFileSync(
@@ -591,6 +955,11 @@ try {
   console.log("Browser checks complete:", checks.length);
 } catch (error) {
   console.error("Browser console:", issues);
+  console.error("RPC errors:", rpcErrors);
+  console.error(
+    "Page status:",
+    await page.locator(".banner, .connection-bar").allTextContents(),
+  );
   console.error(
     "Dialog state:",
     await page.locator("dialog").allTextContents(),

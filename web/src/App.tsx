@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState,
   type FormEvent,
@@ -21,6 +22,11 @@ import {
 import {
   approveTx,
   gameTx,
+  treasuryTx,
+  readUnclaimed,
+  simulateCall,
+  simulationError,
+  type UnclaimedPrize,
   permitTx,
   quoteSwap,
   readAccount,
@@ -49,8 +55,22 @@ import {
   type Round,
 } from "./domain";
 import { sendWalletTransaction, useWallet } from "./wallet";
+import {
+  heartbeat,
+  pendingEligibility,
+  pendingCount,
+  judgeDue,
+  hungJuryDue,
+} from "./pending";
 
-type Page = "today" | "court" | "trade" | "letters" | "claims" | "story";
+type Page =
+  | "today"
+  | "court"
+  | "trade"
+  | "letters"
+  | "claims"
+  | "story"
+  | "pending";
 const PAGES: Record<Page, string> = {
   today: "The daily test",
   court: "The jury",
@@ -58,6 +78,7 @@ const PAGES: Record<Page, string> = {
   letters: "The letters",
   claims: "Claims",
   story: "Our origin",
+  pending: "Pending actions",
 };
 type Review = {
   title: string;
@@ -179,6 +200,74 @@ function Fact({
     </div>
   );
 }
+/** Bind a successful eth_call to its exact sender, calldata and read block. */
+function SimulatedButton({
+  request,
+  address,
+  block,
+  disabled,
+  onClick,
+  children,
+  className,
+}: {
+  request: TransactionRequest;
+  address?: string;
+  block?: number;
+  disabled: boolean;
+  onClick: () => void;
+  children: ReactNode;
+  className?: string;
+}) {
+  const id = useId();
+  const key = `${address}:${block}:${request.to}:${request.data}:${request.value ?? 0}:${disabled}`;
+  const [result, setResult] = useState<{ key: string; error: string }>();
+  useEffect(() => {
+    let active = true;
+    if (!disabled && address && block !== undefined) {
+      simulateCall(request, address, rpc, block)
+        .then(() => {
+          if (active) setResult({ key, error: "" });
+        })
+        .catch((e) => {
+          if (active) setResult({ key, error: simulationError(e) });
+        });
+    }
+    return () => {
+      active = false;
+    };
+  }, [key]);
+  const current = result?.key === key ? result : undefined;
+  const message = disabled
+    ? ""
+    : !address
+      ? "Connect a wallet to check this call."
+      : !current
+        ? "Checking this call with your wallet address…"
+        : current.error
+          ? `Call would fail: ${current.error}. Refresh to check again.`
+          : `Call succeeds at block ${block?.toLocaleString("en-US")}. Gas is paid by your wallet.`;
+  return (
+    <div className="simulated-action">
+      <button
+        className={className}
+        disabled={disabled || !address || !current || !!current.error}
+        aria-describedby={message ? id : undefined}
+        onClick={onClick}
+      >
+        {children}
+      </button>
+      {message && (
+        <p
+          id={id}
+          className={current?.error ? "error-text" : "small"}
+          role="status"
+        >
+          {message}
+        </p>
+      )}
+    </div>
+  );
+}
 export function App() {
   const wallet = useWallet();
   const [page, setPage] = useState<Page>(() => {
@@ -191,6 +280,11 @@ export function App() {
     [loading, setLoading] = useState(true),
     [loadError, setLoadError] = useState(""),
     [accountError, setAccountError] = useState("");
+  const [prizes, setPrizes] = useState<{
+    block: number;
+    items: UnclaimedPrize[];
+  }>();
+  const [prizeError, setPrizeError] = useState("");
   const [now, setNow] = useState(Date.now()),
     [walletOpen, setWalletOpen] = useState(false),
     [walletError, setWalletError] = useState(""),
@@ -267,6 +361,25 @@ export function App() {
       alive = false;
     };
   }, [wallet.connection?.account, s]);
+  useEffect(() => {
+    let active = true;
+    if (s) {
+      setPrizeError("");
+      readUnclaimed(s.block)
+        .then((items) => {
+          if (active) setPrizes({ block: s.block, items });
+        })
+        .catch((e) => {
+          if (active) {
+            setPrizes(undefined);
+            setPrizeError(errorText(e));
+          }
+        });
+    }
+    return () => {
+      active = false;
+    };
+  }, [s]);
   const stale = !!s && now - s.loadedAt > 90000;
   const chainNow = s ? s.timestamp + (now - s.loadedAt) / 1000 : 0;
   const ready = verified && !!s && !stale && !loadError && !busy;
@@ -329,17 +442,32 @@ export function App() {
       setReview(null);
       await refresh();
     } catch (e) {
-      const message = errorText(e);
+      const message = simulationError(e);
       setTxError(message);
       setNotice(message);
     } finally {
       setBusy(false);
     }
   }
+  const currentAccount =
+    account?.block === s?.block &&
+    account?.address.toLowerCase() === wallet.connection?.account.toLowerCase()
+      ? account
+      : undefined;
+  const currentPrizes = prizes?.block === s?.block ? prizes?.items : undefined;
+  const count =
+    s && currentPrizes && (!wallet.connection || currentAccount)
+      ? pendingCount(s, currentPrizes, currentAccount?.sunsets ?? [])
+      : undefined;
+  const walletClaimable = currentAccount
+    ? currentAccount.claimable +
+      currentAccount.sunsets.reduce((sum, c) => sum + c.amount, 0n)
+    : 0n;
   const common = {
     s,
-    account,
-    ready,
+    account: currentAccount,
+    ready: ready && !wrongChain,
+    address: wallet.connection?.account,
     reviewAction,
     connected: !!wallet.connection,
     connect: () => setWalletOpen(true),
@@ -397,6 +525,18 @@ export function App() {
               aria-current={page === id ? "page" : undefined}
             >
               {label}
+              {id === "pending" && (
+                <span
+                  className="pending-badge"
+                  aria-label={
+                    count === undefined
+                      ? "Count unavailable while reading Ethereum"
+                      : `${count} pending actions`
+                  }
+                >
+                  {count ?? "…"}
+                </span>
+              )}
             </a>
           ))}
         </nav>
@@ -466,6 +606,13 @@ export function App() {
         )}
       </div>
       <main id="main" ref={main} tabIndex={-1}>
+        {page === "today" && walletClaimable > 0n && (
+          <p className="claim-banner" role="status">
+            You have{" "}
+            <span className="mono">{formatEther(walletClaimable)} ETH</span> to
+            claim. <a href="#pending">Review pending claims ↗</a>
+          </p>
+        )}
         {page === "today" && <Today {...common} chainNow={chainNow} />}
         {page === "court" && <Court {...common} chainNow={chainNow} />}
         {page === "trade" && (
@@ -476,6 +623,15 @@ export function App() {
           <Claims {...common} accountError={accountError} />
         )}
         {page === "story" && <Story s={s} />}
+        {page === "pending" && (
+          <PendingActions
+            {...common}
+            prizes={currentPrizes}
+            prizeError={prizeError}
+            accountError={accountError}
+            count={count}
+          />
+        )}
       </main>
       <footer>
         <div className="footer-wordmark">
@@ -646,7 +802,395 @@ type Common = {
   reviewAction: (r: Review) => void;
   connected: boolean;
   connect: () => void;
+  address?: string;
 };
+function PendingActions({
+  s,
+  account,
+  ready,
+  connected,
+  connect,
+  address,
+  reviewAction,
+  prizes,
+  prizeError,
+  accountError,
+  count,
+}: Common & {
+  prizes?: UnclaimedPrize[];
+  prizeError: string;
+  accountError: string;
+  count?: number;
+}) {
+  const eligible = s ? pendingEligibility(s) : undefined;
+  const run = s
+    ? heartbeat(s.treasuryBalance, s.nextRunAt, s.timestamp)
+    : undefined;
+  const action = (
+    title: string,
+    description: string,
+    call: string,
+    request: TransactionRequest,
+    details: [string, string][] = [],
+  ) =>
+    reviewAction({
+      title,
+      description,
+      details: [
+        ["Call", call],
+        ["Contract", String(request.to)],
+        ["ETH sent by you", "0 ETH; gas only"],
+        ...details,
+      ],
+      build: () => request,
+    });
+  const time = (at: number) => `${new Date(at * 1000).toUTCString()} (${at})`;
+  return (
+    <>
+      <SectionTitle
+        eyebrow="Public calls. Live Ethereum state."
+        title="PENDING ACTIONS."
+      >
+        Post a letter, collect a claim, fund the heartbeat or close a waiting
+        round.
+      </SectionTitle>
+      <div className="pending-summary">
+        <p role="status">
+          {count === undefined
+            ? prizeError || accountError
+              ? "Pending count unavailable. Use Refresh to retry."
+              : "Reading pending actions…"
+            : count === 0
+              ? "Nothing is waiting. Every public action is up to date."
+              : `${count} pending ${count === 1 ? "action" : "actions"}.`}
+        </p>
+        <p className="small">
+          The count includes public calls, each address with unclaimed prizes
+          and your unclaimed sunset rounds. Eligibility uses the latest loaded
+          block; Refresh checks again.
+        </p>
+        {!connected && <button onClick={connect}>Connect wallet to act</button>}
+      </div>
+      <div className="pending-grid">
+        <section
+          className="panel pending-panel"
+          aria-labelledby="pending-prizes"
+        >
+          <h2 id="pending-prizes">Unclaimed prizes</h2>
+          <p className="small">
+            Every winner prize and judge reward since launch. Only balances that
+            remain unclaimed are listed.
+          </p>
+          {prizeError ? (
+            <p className="error-text" role="alert">
+              Could not read all unclaimed prizes. {prizeError} Use Refresh to
+              retry.
+            </p>
+          ) : !prizes ? (
+            <p role="status">Checking winners and keepers from deployment…</p>
+          ) : !prizes.length ? (
+            <p>No winner prizes or judge rewards are unclaimed.</p>
+          ) : (
+            <ul className="pending-prizes">
+              {prizes.map((prize) => (
+                <li key={prize.address}>
+                  <div>
+                    <Address address={prize.address} />
+                    {prize.address.toLowerCase() === address?.toLowerCase() && (
+                      <span className="tag">Your wallet</span>
+                    )}
+                    <p>
+                      <span className="mono">
+                        {formatEther(prize.amount)} ETH
+                      </span>{" "}
+                      · unclaimed
+                    </p>
+                  </div>
+                  {prize.address.toLowerCase() === address?.toLowerCase() && (
+                    <SimulatedButton
+                      request={gameTx("claim")}
+                      address={address}
+                      block={s?.block}
+                      disabled={!ready}
+                      onClick={() =>
+                        action(
+                          "Claim your ETH",
+                          "Collect all winner prizes and judge rewards owed to your connected wallet.",
+                          "game.claim()",
+                          gameTx("claim"),
+                          [
+                            [
+                              "Amount at this block",
+                              `${formatEther(prize.amount)} ETH`,
+                            ],
+                            ["Recipient", prize.address],
+                          ],
+                        )
+                      }
+                    >
+                      Claim
+                    </SimulatedButton>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          <h3>Sunset shares</h3>
+          {!connected ? (
+            <p>
+              Connect your wallet to check every round for your sunset shares.
+            </p>
+          ) : accountError ? (
+            <p className="error-text" role="alert">
+              Could not read sunset shares. {accountError} Use Refresh to retry.
+            </p>
+          ) : !account ? (
+            <p role="status">Checking all rounds for your wallet…</p>
+          ) : !account.sunsets.length ? (
+            <p>No sunset shares are waiting for this wallet.</p>
+          ) : (
+            <ul className="pending-prizes">
+              {account.sunsets.map((share) => (
+                <li key={share.day}>
+                  <div>
+                    <strong>{dayLabel(share.day)}</strong>
+                    <p>
+                      <span className="mono">
+                        {formatEther(share.amount)} ETH
+                      </span>{" "}
+                      · unclaimed
+                    </p>
+                  </div>
+                  <SimulatedButton
+                    request={gameTx("claimSunset", [share.day])}
+                    address={address}
+                    block={s?.block}
+                    disabled={!ready}
+                    onClick={() =>
+                      action(
+                        "Claim a sunset share",
+                        "Collect your share for this round. Each eligible round requires its own claim.",
+                        `game.claimSunset(${share.day})`,
+                        gameTx("claimSunset", [share.day]),
+                        [
+                          ["Amount", `${formatEther(share.amount)} ETH`],
+                          ["Recipient", account.address],
+                        ],
+                      )
+                    }
+                  >
+                    Claim sunset share
+                  </SimulatedButton>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+        <section
+          className="panel pending-panel"
+          aria-labelledby="pending-letter"
+        >
+          <h2 id="pending-letter">First-verdict letter</h2>
+          <p>
+            {!s
+              ? "Reading the first-verdict status…"
+              : eligible?.letter
+                ? "The first-verdict letter has not been posted"
+                : s.firstVerdictAnnounced
+                  ? "The first-verdict letter has been posted."
+                  : "No settled round is waiting for its first-verdict letter."}
+          </p>
+          {eligible?.letter && (
+            <SimulatedButton
+              request={gameTx("announceFirstVerdict")}
+              address={address}
+              block={s?.block}
+              disabled={!ready}
+              onClick={() =>
+                action(
+                  "Post the first-verdict letter",
+                  "Ask the game to post its fixed first-verdict letter through the herald. Your wallet pays Ethereum gas.",
+                  "game.announceFirstVerdict()",
+                  gameTx("announceFirstVerdict"),
+                )
+              }
+            >
+              Post first-verdict letter
+            </SimulatedButton>
+          )}
+          <a className="pending-link" href="#letters">
+            Read the official letters ↗
+          </a>
+        </section>
+        <section
+          className="panel pending-panel"
+          aria-labelledby="pending-heartbeat"
+        >
+          <h2 id="pending-heartbeat">Heartbeat treasury</h2>
+          <p>
+            {!s
+              ? "Reading treasury state…"
+              : !s.treasuryBalance
+                ? "The treasury has no ETH to send."
+                : eligible?.heartbeat
+                  ? "The next heartbeat can be funded."
+                  : "The treasury is in its cooldown period."}
+          </p>
+          {s && run && (
+            <>
+              <dl className="pending-facts">
+                <div>
+                  <dt>Treasury balance</dt>
+                  <dd>{formatEther(s.treasuryBalance)} ETH</dd>
+                </div>
+                <div>
+                  <dt>lastRunAt</dt>
+                  <dd>
+                    {s.lastRunAt ? time(s.lastRunAt) : "0 · Never funded"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>nextRunAt</dt>
+                  <dd>{s.nextRunAt ? time(s.nextRunAt) : "0 · No cooldown"}</dd>
+                </div>
+                <div>
+                  <dt>Amount this call would send</dt>
+                  <dd>{formatEther(run.amount)} ETH</dd>
+                </div>
+                <div>
+                  <dt>Cooldown this call would set</dt>
+                  <dd>{run.cooldown} seconds</dd>
+                </div>
+              </dl>
+              <p className="small">
+                Amount = min(balance, 0.01 ETH). Cooldown = floor(43,200 seconds
+                × amount / 0.01 ETH). Dust can produce a zero-second cooldown.
+                Amounts may change before execution.
+              </p>
+              <p>
+                The ETH goes to the swarm wallet{" "}
+                <External
+                  className="pending-recipient mono"
+                  href={`${EXPLORER}/address/${s.swarm}`}
+                >
+                  {s.swarm}
+                </External>
+              </p>
+              <SimulatedButton
+                request={treasuryTx()}
+                address={address}
+                block={s.block}
+                disabled={!ready || !eligible?.heartbeat}
+                onClick={() =>
+                  action(
+                    "Fund the next heartbeat",
+                    "Send ETH from the heartbeat treasury to the swarm wallet. Your wallet pays gas; the treasury supplies the ETH.",
+                    "treasury.fundNextRun()",
+                    treasuryTx(),
+                    [
+                      [
+                        "Treasury sends at this block",
+                        `${formatEther(run.amount)} ETH`,
+                      ],
+                      ["Recipient · swarm wallet", s.swarm],
+                      ["Cooldown at this block", `${run.cooldown} seconds`],
+                    ],
+                  )
+                }
+              >
+                Fund next run
+              </SimulatedButton>
+            </>
+          )}
+        </section>
+        <section
+          className="panel pending-panel"
+          aria-labelledby="pending-housekeeping"
+        >
+          <h2 id="pending-housekeeping">Round housekeeping</h2>
+          <div className="pending-task">
+            <h3>Sunset settlement</h3>
+            <p>
+              {!s
+                ? "Reading sunset status…"
+                : eligible?.sunset
+                  ? "Seven unsettled rounds are waiting for a pot split."
+                  : "No sunset settlement is due."}
+            </p>
+            {eligible?.sunset && (
+              <SimulatedButton
+                request={gameTx("sunset")}
+                address={address}
+                block={s?.block}
+                disabled={!ready}
+                onClick={() =>
+                  action(
+                    "Settle the sunset",
+                    "Split the pot into equal claims for entrants of the seven unsettled rounds. Entrants then claim their shares separately.",
+                    "game.sunset()",
+                    gameTx("sunset"),
+                  )
+                }
+              >
+                Settle sunset
+              </SimulatedButton>
+            )}
+          </div>
+          <div className="pending-task">
+            <h3>Hung jury</h3>
+            <p>
+              {!s
+                ? "Reading the jury timeout…"
+                : eligible?.hung
+                  ? "The jury timeout has passed. This round can be closed without a winner."
+                  : s.hungAt
+                    ? `The jury timeout is ${time(s.hungAt)}.`
+                    : "No jury timeout is waiting."}
+            </p>
+            {eligible?.hung && (
+              <SimulatedButton
+                request={gameTx("declareHungJury")}
+                address={address}
+                block={s?.block}
+                disabled={!ready}
+                onClick={() =>
+                  action(
+                    "Declare a hung jury",
+                    "Close the timed-out round without a winner. Its pot carries over, or is split after seven unsettled rounds.",
+                    "game.declareHungJury()",
+                    gameTx("declareHungJury"),
+                    [["Round", dayLabel(s!.nextDay)]],
+                  )
+                }
+              >
+                Declare hung jury
+              </SimulatedButton>
+            )}
+          </div>
+          <div className="pending-task">
+            <h3>Next verdict</h3>
+            <p>
+              {!s
+                ? "Reading the next round…"
+                : eligible?.judge
+                  ? `The round for ${dayLabel(s.nextDay)} is closed and has no pending request.`
+                  : s.nextRound?.status === 2
+                    ? "An oracle request is pending. Wait for its verdict or timeout."
+                    : s.sunsetDue
+                      ? "Settle the sunset before requesting the next verdict."
+                      : "No closed round is waiting for a verdict request."}
+            </p>
+            {eligible?.judge && (
+              <a className="pending-link" href="#court">
+                Open the Court to approve IMD and judge ↗
+              </a>
+            )}
+          </div>
+        </section>
+      </div>
+    </>
+  );
+}
 function Today({
   s,
   account,
@@ -885,7 +1429,7 @@ function Court({
   ready,
   reviewAction,
   connected,
-  chainNow,
+  address,
 }: Common & { chainNow: number }) {
   const [rounds, setRounds] = useState<Round[]>([]),
     [loading, setLoading] = useState(true),
@@ -938,8 +1482,8 @@ function Court({
   }
   const next = s?.nextRound,
     canJudge =
-      !!s && !!next && next.day < s.day && next.status === 1 && !s.sunsetDue;
-  const canHung = !!s && s.hungAt > 0 && chainNow >= s.hungAt;
+      !!s && judgeDue(s.nextDay, next?.status, s.timestamp, s.sunsetDue);
+  const canHung = !!s && hungJuryDue(s.hungAt, s.timestamp);
   const approve = !!account && !!s && account.judgeAllowance < s.judgePrice;
   const visible = rounds.filter(
     (r) =>
@@ -1009,7 +1553,10 @@ function Court({
                   Give the game permission to spend {fmt(s?.judgePrice)} IMD.
                 </p>
               </div>
-              <button
+              <SimulatedButton
+                address={address}
+                block={s?.block}
+                request={approveTx(A.imd, A.game, s?.judgePrice ?? 0n)}
                 disabled={
                   !ready ||
                   !canJudge ||
@@ -1038,7 +1585,7 @@ function Court({
                 }
               >
                 {account && !approve ? "Approved" : "Approve IMD"}
-              </button>
+              </SimulatedButton>
             </li>
             <li>
               <b>2</b>
@@ -1050,7 +1597,10 @@ function Court({
                     : "Connect your wallet to check its IMD balance."}
                 </p>
               </div>
-              <button
+              <SimulatedButton
+                address={address}
+                block={s?.block}
+                request={gameTx("judge")}
                 className="primary"
                 disabled={
                   !ready ||
@@ -1085,7 +1635,7 @@ function Court({
                 }
               >
                 Judge round ↗
-              </button>
+              </SimulatedButton>
             </li>
           </ol>
           {account && s && account.imd < s.judgePrice && (
@@ -1115,7 +1665,10 @@ function Court({
               ? `Next timeout: ${new Date(s.hungAt * 1000).toUTCString()}`
               : "No timeout is running."}
           </p>
-          <button
+          <SimulatedButton
+            address={address}
+            block={s?.block}
+            request={gameTx("declareHungJury")}
             className="full"
             disabled={!ready || !canHung}
             onClick={() =>
@@ -1132,8 +1685,11 @@ function Court({
             }
           >
             Declare hung jury
-          </button>
-          <button
+          </SimulatedButton>
+          <SimulatedButton
+            address={address}
+            block={s?.block}
+            request={gameTx("sunset")}
             className="full"
             disabled={!ready || !s?.sunsetDue}
             onClick={() =>
@@ -1150,7 +1706,7 @@ function Court({
             }
           >
             Settle sunset
-          </button>
+          </SimulatedButton>
           <p className="small">
             Sunset settlement becomes available when the seventh hung jury was
             recorded by an oracle callback.
@@ -1744,6 +2300,7 @@ function Letters({ s }: { s: Snapshot | undefined }) {
 }
 function Claims({
   s,
+  address,
   account,
   ready,
   reviewAction,
@@ -1789,7 +2346,10 @@ function Claims({
                   ? "This is your unclaimed balance, ready to collect."
                   : "Nothing to collect yet. Prizes and judge rewards appear here after confirmation."}
               </p>
-              <button
+              <SimulatedButton
+                address={address}
+                block={s?.block}
+                request={gameTx("claim")}
                 className="primary"
                 disabled={!ready || account.claimable === 0n}
                 onClick={() =>
@@ -1810,7 +2370,7 @@ function Claims({
                 }
               >
                 Claim ETH ↗
-              </button>
+              </SimulatedButton>
             </div>
             <div className="panel">
               <h2>Sunset claims</h2>
@@ -1825,7 +2385,10 @@ function Claims({
                       <strong>{dayLabel(c.day)}</strong>
                       <p>{fmt(c.amount)} ETH</p>
                     </div>
-                    <button
+                    <SimulatedButton
+                      address={address}
+                      block={s?.block}
+                      request={gameTx("claimSunset", [c.day])}
                       disabled={!ready}
                       onClick={() =>
                         reviewAction({
@@ -1842,7 +2405,7 @@ function Claims({
                       }
                     >
                       Claim share
-                    </button>
+                    </SimulatedButton>
                   </div>
                 ))
               ) : (

@@ -194,8 +194,8 @@ Preview the existing export without installing anything using `python3 -m http.s
 open `http://127.0.0.1:4173/dist/`.
 
 For restricted contributor workspaces, install outside the repository. This job used an exact copy
-of `web/` in `/tmp/meatbag-frontend`, ran `npm ci --cache /tmp/meatbag-npm-cache` there, then ran the same
-scripts and copied its generated sibling `dist/` back. No `node_modules`, npm cache, vendor archives,
+of `web/` in `/tmp/meat-pending/web`, ran `npm ci` there with a cache under `/tmp/meat-pending`,
+then ran the same scripts and copied its generated sibling `dist/` back. No `node_modules`, npm cache, vendor archives,
 ignore-file changes or new submodules are part of the deliverable. Never add generated dependencies
 at any nesting level to Git. Include the finished root `dist/` alongside `web/` and its lockfile.
 
@@ -217,12 +217,20 @@ at any nesting level to Git. Include the finished root `dist/` alongside `web/` 
   reading, explicit partial-feed errors and count reconciliation against `herald.count()`.
 - **Claims:** winner and judge rewards in their shared claimable balance, plus every eligible
   unclaimed sunset share across all historical rounds.
+- **Pending actions:** first-verdict letter, every positive winner/keeper claim, connected-wallet
+  sunset shares, heartbeat funding and round housekeeping. A shared badge counts public calls,
+  unclaimed prize addresses and the connected wallet's sunset rounds. The Today banner links to
+  available claims. The original six pages and their routes remain available.
 - **Our origin:** six ideas, a 100-agent vote, 71 votes for MEATBAG, original oracle record,
   contract addresses, heartbeat balance and immutable contract limitations. There is no Twitter.
 
 Only EIP-6963 injected wallets are discovered. There is no WalletConnect, private key, API key,
 backend or remote asset CDN. On mobile, open the site in a compatible wallet browser. Public reads
-use only `https://ethereum-rpc.publicnode.com`; transaction simulation/signing use the selected wallet.
+use `https://ethereum-rpc.publicnode.com`. Pending calls, Court actions and Claims are simulated
+with `eth_call` from the selected address at the read block before their buttons enable. Every
+transaction is simulated again through the selected wallet immediately before gas estimation/send.
+Decoded contract errors appear beside the unavailable action. Changing accounts clears the session;
+changing blocks invalidates earlier button simulations.
 The app explicitly switches to Ethereum mainnet and rechecks chain/account before each write.
 Runtime hashes, immutable wiring and the pool ID are verified before enabling transactions. RPC
 failure or data older than 90 seconds disables writes. Every write has a review with amount,
@@ -253,54 +261,99 @@ The launch vote links to the public [IMD oracle record](https://api.imd.fun/orac
 Panel UUIDs are decoded from the attestation’s right-padded bytes32 and linked through IMD’s
 `/oracle/requests?jobId=…` endpoint; raw intake and panel identifiers remain visible.
 
-### Worker validation
+### Pending-action reads and exact calls
 
-Executed against the final source/export:
+All new state is pinned to the same read block as the existing snapshot. `pending.ts` holds the
+eligibility rules; action eligibility uses `block.timestamp`, not the browser's clock.
 
-| Command | Actual result |
-| --- | --- |
-| `forge build --skip test --skip script` | Passed; existing Solidity lint warnings remain, no Solidity changes. |
-| `npm run typecheck --prefix web` / build’s `tsc --noEmit` | Passed. |
-| `npm run build --prefix web` | Passed; relative asset export, no oversized chunk warning. |
-| `npm test --prefix web` | 5 tests passed: ASCII/bytes, amounts, formatting, oracle UUID links and wallet guards. |
-| `npm run test:fork --prefix web -- ../artifacts/fork-results.json` | 18 checks passed on mainnet fork block 26156153. Every exposed write covered. |
-| `npm run test:browser --prefix web -- ../dist ../artifacts` | 41 checks passed; zero unexpected browser errors and zero axe violations across six pages. |
+- Letter: `!firstVerdictAnnounced && cursor > 0` and `round(roundDays(cursor - 1)).status == 3`.
+  Sends `game.announceFirstVerdict()`.
+- Prizes: scan `Verdict.winner` and `Judging.keeper` from **26155857**, deduplicate addresses,
+  then read every candidate's `claimable` at the snapshot block. Scan in bounded/adaptive ranges;
+  cache only candidate addresses, recheck balances every time, reset the cache on a checkpoint
+  hash mismatch or fork rewind. Failed scans are errors, never a fabricated empty list.
+  Only the selected wallet can send `game.claim()`; other balances link to Etherscan.
+- Sunset claims: check every historical round, positive `sunsetShare`, entry membership and
+  `!sunsetClaimed(day, wallet)`, then send `game.claimSunset(day)` separately per round.
+- Heartbeat: read the treasury balance, `lastRunAt`, `nextRunAt`, and immutable `SWARM()`.
+  Show the exact `min(balance, 0.01 ETH)` and integer `floor(43200 * amount / 0.01 ETH)` seconds.
+  `treasury.fundNextRun()` enables only at/after `nextRunAt` with positive balance and a successful
+  simulation. ETH goes from the treasury to **0xd01122bBfFd00fc96252c8b29867a5359a3bca13**;
+  the caller pays gas. Dust can produce a zero-second cooldown.
+- Housekeeping: `sunsetDue()` enables `game.sunset()`; a nonzero elapsed `hungJuryAt()` enables
+  `game.declareHungJury()`. A closed open-status round with no pending request links to the
+  existing Court's exact IMD approval and `judge()` flow.
 
-Fork and browser scripts require `anvil` on PATH and network access to the public archive RPC. The
-browser script starts/stops its own preview and fork, uses the real production export under
-`/preview/`, and routes RPC requests to that local fork. It uses installed Chromium at
-`BROWSER_EXECUTABLE_PATH`, or Playwright’s Chromium if installed (`cd web && npx playwright install chromium`).
-No real wallet, mainnet transaction, live deployment or live oracle request was sent.
+The badge counts pending operations, including claims belonging to other addresses, rather than
+only buttons this wallet can currently send. Disconnected sunset eligibility is unknown. While
+required reads are incomplete the badge shows an ellipsis; failures are shown in the panel.
+Amounts can change before execution, and a successful simulation does not reserve chain state.
 
-The fork exercises real deployed bytecode, including the live IMD Intake call and Uniswap router.
-Test-only IMD funding, winner credit, and the seventh weak-panel callback state use explicit local
-storage fixtures. A real signed offchain winner callback was not available and is not claimed as
-validated. Browser wallet interactions use a local EIP-6963 test provider; installed-wallet/mobile
-hardware, screen readers, Safari/Firefox and native browser 200% zoom were not tested. Chromium
-reflow at 1280, 768, 390 and 320px, 200% root text enlargement, focus recovery, reduced motion,
-forced colors, error recovery and accessibility scanning were tested.
+### Worker validation — pending-actions update
 
-See [DESIGN.md](DESIGN.md) for implemented tokens/components and [artifacts/validation.md](artifacts/validation.md)
-for the six-domain Better Interface review, source findings, fixes, evidence and limitations. The
-machine-readable results and screenshots are in `artifacts/`. [web/VALIDATION.md](web/VALIDATION.md)
-keeps the essential results in the source tree as well.
-
-### Publish on IMD
-
-Publish the **built `dist/`**, not the repository or `web/` source:
+The existing `web/package.json` and lockfile are unchanged. Vitest is installed only as optional
+verification tooling in the temporary source copy; the delivered configuration discovers the new
+`web/tests/pending.test.mjs` suite without altering the original Node test runner:
 
 ```sh
-imd site publish dist --name meatbag
-# If accepted, use the returned site ID:
+# Run inside a temporary copy of web/ in restricted contributor environments.
+npm ci
+npm install --no-save --package-lock=false vitest@3.2.4
+npm test
+npx vitest run --config vitest.config.mjs
+npm run typecheck
+npm run build
+FORK_RPC_URL=https://eth.drpc.org npm run test:fork -- ../artifacts/fork-results.json
+FORK_RPC_URL=https://eth.drpc.org BROWSER_EXECUTABLE_PATH=/usr/bin/google-chrome npm run test:browser -- ../dist ../artifacts
+```
+
+| Check | Actual result |
+| --- | --- |
+| Production build + separate TypeScript check | Passed; Vite relative export, no oversized chunk warning. |
+| Original Node suite | 5 passed. |
+| New Vitest suite | 12 passed: true/false eligibility, boundaries/dust, counting, complete candidate discovery, range retries/reorg reset, exact calldata and decoded failures. |
+| Mainnet fork, pinned **26156153** | 20 passed, including `eth_call` before each successful write, treasury transfer/cooldown boundaries, first-letter event, claims and housekeeping. |
+| Production browser checks | 50 passed: all seven routes, injected-wallet flows, custom revert recovery, receipt refresh, third-party balances, sunset shares/empty state, mobile reflow, keyboard and axe checks. |
+| Contracts and protected build/dependency paths | Unchanged; no Solidity build, redeployment or mainnet transaction was performed. |
+
+Fork/browser scripts require Anvil and an archive-capable Ethereum RPC. PublicNode refused
+historical state at the pinned block during this run; the supplied alternate `eth.drpc.org` served
+it. Public endpoints also produced transient rate-limit errors. The scripts use block-number fork
+reads and a bounded request rate. The browser script owns and closes its preview/fork processes;
+it serves the actual export at `/preview/` to check relative assets.
+
+Fork fixtures are explicitly local: IMD funding, funded winner credit, settled first-verdict state,
+seventh hung callback state, treasury balances/cooldown, and a temporarily rejecting swarm receiver.
+No live oracle signature was available. Production wallet interactions were tested through a local
+EIP-6963 fork provider; no real extension, physical mobile device, screen reader, Safari/Firefox or
+native browser zoom was tested. Chromium widths **1280, 768, 390, 320**, 200% text enlargement,
+reduced motion, forced colors and failure/retry states were checked. These worker checks are not
+an independent audit.
+
+[DESIGN.md](DESIGN.md) documents the final tokens and components.
+[web/VALIDATION.md](web/VALIDATION.md) and [artifacts/validation.md](artifacts/validation.md) record
+six-domain Better Interface coverage, findings, actual results and remaining limitations.
+
+Git delivery: implementation commit `ab12df9` was created on `main` in an isolated checkout,
+keeping the protected workspace `.git/` untouched. Direct push could not authenticate to GitHub.
+The complete source/export remains in this workspace for the contributor submission upload.
+See [artifacts/git-result.json](artifacts/git-result.json).
+
+### Publish the existing meat site on IMD
+
+Publish the **built root `dist/`** to the existing **meat** label. Do not use `meatbag` or deploy
+contracts. The requested existing URL is [meat.sites.imd.fun](https://meat.sites.imd.fun).
+
+```sh
+imd site publish dist --name meat
+# Only after success, inspect the site ID returned by the publisher:
 imd site status <returned-site-id>
 ```
 
-**Publishing is not complete.** The actual attempted command bundled this export (206350 bytes
-compressed), then IMD refused it with **HTTP 503 `member_sites_closed`: “this plane names no member
-sites”**. No site ID, CID or live URL was returned. The local build is ready, but the IMD publishing
-service must enable the appropriate site publication path before that command can succeed. No
-alternate label or fabricated hosting URL was substituted. `artifacts/publish-result.json` records
-the actual attempt. Do not describe this site as hosted until IMD returns a successful publication.
+**This update was not published.** The attempted command bundled the export to **210509 bytes**,
+then returned **HTTP 503 `member_sites_closed`: “this plane names no member sites”**. No new site ID,
+CID or version was returned. The existing hosted version remains in place; publication needs the
+IMD site service to accept this path. See [artifacts/publish-result.json](artifacts/publish-result.json).
 
 ## Deployment parameters (for the manifest step)
 
@@ -361,8 +414,8 @@ The game and herald hold no MEAT and were allocated none; the pot is ETH only.
   is an operational responsibility: it needs a separate adversarial review by an independent
   contributor before release. Tests passing is not an audit. Slither/Mythril were not run here (not
   provided in this environment).
-- **Hosting the site:** the live-contract frontend and static export are now implemented; the IMD
-  publish attempt was refused with `503 member_sites_closed`, as recorded above.
+- **Hosting the site:** the pending-actions update and rebuilt static export are implemented; publishing to
+  the existing `meat` label was refused with `503 member_sites_closed`, as recorded above.
 
 ## Operational responsibilities
 

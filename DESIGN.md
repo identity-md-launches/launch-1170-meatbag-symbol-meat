@@ -7,7 +7,7 @@ funny: an oversized condensed headline, a restrained coral accent, warm neutral 
 monospaced onchain metadata. Humor stays in explanatory copy and empty states; transactions,
 amounts, errors and approvals use plain, literal language.
 
-The primary experience is the daily round. Other hash-routed pages share the same masthead,
+The primary experience is the daily round. The seven hash-routed pages share the same masthead,
 navigation, chain status, transaction notices and footer. There is no owner dashboard, social feed,
 light theme or ornamental animation. Source: `web/src/App.tsx`, `web/src/style.css`.
 
@@ -36,9 +36,9 @@ Coral also appears in the brand headline and decorative mark; this is a delibera
 not the sole indication of interactivity. Controls have button shapes, borders, underlines or a
 stable navigation position. States always have text, not color alone.
 
-Measured pairs (sRGB): text/page 15.851:1; muted/page 8.027:1; muted/panel 7.279:1; primary-button
-text/fill 6.474:1; accent/page 6.590:1. See `artifacts/contrast.json` for exact calculations and
-which pairs were confirmed in rendered styles. Forced-colors mode keeps system-color outlines.
+Rendered sRGB pairs measured for this update: badge text/raised surface 12.939:1;
+muted text/panel 7.279:1; treasury values and links/panel 14.374:1.
+See `artifacts/pending-contrast.json` for computed foreground/background values and ratios. Forced-colors mode keeps system-color outlines.
 
 ## Typography
 
@@ -76,14 +76,14 @@ spacing values in many selectors; there is no separate theme framework.
 - **At 850px:** daily entry panel, court, trade, claims and story become single-column. Letter
   sidebar moves above its feed. The page gutters shrink to 24px per side.
 - **At 570px:** gutters are 16px; navigation becomes an explicit three-column/two-row grid,
-  with all six destinations visible. Hide the decorative seal and header network word. The pot
+  with the original six destinations visible and Pending actions in a full-width third row. Hide the decorative seal and header network word. The pot
   occupies a full fact row, with count/timer beneath. Form panels use 20px padding; steps and
   dialog actions stack; helper text wraps. Hero instructions use two short rows.
 
 No fixed-height prose containers or sticky action bars obstruct content. The trade and message
 areas use `minmax(0, 1fr)`; long identifiers wrap anywhere. Dialogs are limited to the viewport
 with internal scrolling and overscroll containment. Tested widths: 1280, 768, 390 and 320 CSS
-pixels on every page, with no horizontal overflow. At 390px, 200% root text enlargement also
+pixels on every page, with no horizontal overflow in the browser suite. At 390px, 200% root text enlargement also
 reflowed after correcting the hero’s intrinsic minimum width.
 
 ## Elevation & depth
@@ -101,7 +101,7 @@ and on small screens. The M mark/favicon are small original SVGs, with no raster
 
 ## Components
 
-All page patterns live in `web/src/App.tsx`; shared behavior is in `chain.ts`, `domain.ts` and
+All page patterns live in `web/src/App.tsx`; shared behavior is in `chain.ts`, `pending.ts`, `domain.ts` and
 `wallet.ts`. This is an application, not an exported component library.
 
 | Component / selector | Use and states |
@@ -117,10 +117,15 @@ All page patterns live in `web/src/App.tsx`; shared behavior is in `chain.ts`, `
 | `Trade` / `.segmented` | Native buttons with `aria-pressed`; decimal amount, labelled tolerance select, quote and minimum output. Quotes clear when direction/amount/wallet changes. Exact approvals stay separate from swaps. |
 | `Letters` / `.letter` | Full text, block and original transaction; honest scan/partial/complete states; load older messages in batches of 20. |
 | `Claims` | Address-specific balance plus exhaustive sunset eligibility; disabled zero claims and explicit loading/error states. |
+| `PendingActions` / `.pending-grid` | Four status sections use the existing panel surface: claims, first-verdict letter, heartbeat and housekeeping. Two equal `minmax(0, 1fr)` columns with a 24px gap; one column at 850px. Mobile panels use 24px block/16px inline padding at 570px. |
+| `SimulatedButton` / `.simulated-action` | Native disabled transaction button until the selected sender's exact call succeeds at the snapshot block. Text states explain checking, missing wallet or decoded failure. Reuses review dialog; no new animation. Also used for the original Court and Claims operations. |
+| `.pending-badge` | Compact raised-surface count beside the shared navigation label; 13px mono/tabular text, 24px visual minimum width, 6px radius. The entire navigation link is the touch target. An ellipsis means the required reads are incomplete. |
+| `.claim-banner` | One-line Today claim notice at desktop widths, naturally wrapping on mobile; exact combined ETH amount and a 44px link to Pending actions. |
+| `.pending-facts`, `.pending-prizes` | Definition lists for exact treasury amounts/Unix and UTC timestamps; semantic lists for claim addresses and per-round shares. Values wrap without clipping and use 13px mono text at 1.6 line height. Full swarm address remains visible. |
 | `.banner`, `.transaction-notice` | Persistent actionable failures and polite transaction updates, with explorer links. |
 
 All form controls use real labels. A 3px `--focus` outline with 4px offset is shared; buttons are
-at least 44px high (the quiet Refresh control is 40px). Hover effects are gated to hover-capable
+at least 44px high, including the quiet Refresh control. New standalone panel links and navigation targets also measure at least 44px in each dimension. Hover effects are gated to hover-capable
 pointers. The only motion is a 120ms color/background/border transition and a 0.96 pressed-button
 scale, both inside `prefers-reduced-motion: no-preference`. There are no page-load animations.
 
@@ -135,4 +140,5 @@ scale, both inside `prefers-reduced-motion: no-preference`. There are no page-lo
 - Preserve reduced-motion and forced-colors behavior. Do not add motion or a second theme to fill a checklist.
 
 The six-domain review and remaining verification limitations are recorded in `artifacts/validation.md`
-and `web/VALIDATION.md`. The design does not establish that IMD hosting succeeded; that attempt was refused.
+and `web/VALIDATION.md`. No theme, token family or animation was added. IMD refused publication of this
+update to the existing `meat` label; the finished local export is retained.

@@ -6,6 +6,7 @@ import {
   type JsonRpcSigner,
   type TransactionRequest,
 } from "ethers";
+import { simulationError } from "./chain";
 export type Injected = Eip1193Provider & {
   on?: (event: string, fn: (v: any) => void) => void;
   removeListener?: (event: string, fn: (v: any) => void) => void;
@@ -94,7 +95,12 @@ export async function sendWalletTransaction(
     throw Error(
       "Your wallet account changed. Connect again before continuing.",
     );
-  // Simulate with the wallet's current state before prompting for a signature.
+  // Recheck eth_call with the wallet's current state immediately before sending.
+  try {
+    await c.signer.call(request);
+  } catch (e) {
+    throw Error(simulationError(e));
+  }
   const gas = await c.signer.estimateGas(request);
   return c.signer.sendTransaction({
     ...request,
